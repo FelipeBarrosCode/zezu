@@ -37,6 +37,73 @@ pub type LanguageModelCompletionStream = futures::stream::BoxStream<
     Result<LanguageModelCompletionEvent, LanguageModelCompletionError>,
 >;
 
+/// An owned provider execution prepared after resolving app configuration.
+/// The execution interface has no dependency on a UI framework. Providers
+/// must resolve app-owned configuration while preparing the execution.
+pub struct PreparedLanguageModelCompletion {
+    execution: futures::future::BoxFuture<
+        'static,
+        Result<LanguageModelCompletionStream, LanguageModelCompletionError>,
+    >,
+}
+
+impl PreparedLanguageModelCompletion {
+    pub fn new(
+        execution: futures::future::BoxFuture<
+            'static,
+            Result<LanguageModelCompletionStream, LanguageModelCompletionError>,
+        >,
+    ) -> Self {
+        Self { execution }
+    }
+
+    pub async fn execute(
+        self,
+    ) -> Result<LanguageModelCompletionStream, LanguageModelCompletionError> {
+        self.execution.await
+    }
+}
+
+#[cfg(test)]
+mod prepared_completion_tests {
+    use super::*;
+    use futures::{FutureExt as _, StreamExt as _};
+
+    #[test]
+    fn prepared_execution_can_move_to_another_thread() -> anyhow::Result<()> {
+        let execution = PreparedLanguageModelCompletion::new(
+            async {
+                Ok(
+                    futures::stream::iter([Ok(LanguageModelCompletionEvent::Text(
+                        "response".into(),
+                    ))])
+                    .boxed(),
+                )
+            }
+            .boxed(),
+        );
+        let worker = std::thread::spawn(move || {
+            futures::executor::block_on(async {
+                execution
+                    .execute()
+                    .await?
+                    .collect::<Vec<_>>()
+                    .await
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()
+            })
+        });
+        let events = worker
+            .join()
+            .map_err(|_| anyhow!("model worker panicked"))??;
+        assert_eq!(
+            events,
+            vec![LanguageModelCompletionEvent::Text("response".into())]
+        );
+        Ok(())
+    }
+}
+
 /// A completion event from a language model.
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub enum LanguageModelCompletionEvent {

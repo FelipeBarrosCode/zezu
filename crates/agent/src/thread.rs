@@ -3076,7 +3076,12 @@ impl Thread {
             log::debug!("Calling model.stream_completion, attempt {}", attempt);
 
             let events = match provider {
-                Ok(provider) => provider.stream_completion(&model, request, cx).await,
+                Ok(provider) => {
+                    provider
+                        .prepare_completion(&model, request, cx)
+                        .execute()
+                        .await
+                }
                 Err(error) => Err(error),
             };
             let (mut events, mut error) = match events {
