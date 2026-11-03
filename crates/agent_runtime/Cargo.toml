@@ -1,0 +1,30 @@
+[package]
+name = "agent_runtime"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "GPL-3.0-or-later"
+
+[lib]
+path = "src/agent_runtime.rs"
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+futures = "0.3"
+infinity-agent-core = { git = "https://github.com/hydro-project/infinity", rev = "1abc6fcff1f186124f924b56aa92c3a3684c90c5" }
+infinity-provider-protocol = { git = "https://github.com/hydro-project/infinity", rev = "1abc6fcff1f186124f924b56aa92c3a3684c90c5" }
+log = "0.4"
+rap-protocol = { git = "https://github.com/hydro-project/infinity", rev = "1abc6fcff1f186124f924b56aa92c3a3684c90c5" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"

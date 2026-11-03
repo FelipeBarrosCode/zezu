@@ -399,6 +399,15 @@ impl Default for IconOrSvg {
 
 /// Sends requests to a provider's models.
 pub trait LanguageModelClient: 'static {
+    fn prepare_completion(
+        &self,
+        model: &LanguageModel,
+        request: LanguageModelRequest,
+        cx: &AsyncApp,
+    ) -> PreparedLanguageModelCompletion {
+        PreparedLanguageModelCompletion::new(self.stream_completion(model, request, cx))
+    }
+
     /// Streams a completion of `request` from `model`, which must be one of
     /// this provider's models.
     fn stream_completion(
