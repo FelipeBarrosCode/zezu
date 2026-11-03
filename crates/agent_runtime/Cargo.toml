@@ -13,12 +13,15 @@ doctest = false
 workspace = true
 
 [dependencies]
+async-channel.workspace = true
 anyhow = "1"
 async-trait = "0.1"
+base64.workspace = true
 futures = "0.3"
 infinity-agent-core = { git = "https://github.com/hydro-project/infinity", rev = "1abc6fcff1f186124f924b56aa92c3a3684c90c5" }
 infinity-provider-protocol = { git = "https://github.com/hydro-project/infinity", rev = "1abc6fcff1f186124f924b56aa92c3a3684c90c5" }
 log = "0.4"
+language_model_core.workspace = true
 rap-protocol = { git = "https://github.com/hydro-project/infinity", rev = "1abc6fcff1f186124f924b56aa92c3a3684c90c5" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

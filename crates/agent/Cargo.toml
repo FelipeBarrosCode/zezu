@@ -23,6 +23,7 @@ action_log.workspace = true
 async-channel.workspace = true
 agent-client-protocol.workspace = true
 agent_servers.workspace = true
+agent_runtime.workspace = true
 agent_settings.workspace = true
 agent_skills.workspace = true
 anyhow.workspace = true
@@ -37,6 +38,7 @@ db.workspace = true
 feature_flags.workspace = true
 fs.workspace = true
 futures.workspace = true
+futures-lite.workspace = true
 git.workspace = true
 gpui.workspace = true
 handlebars = { workspace = true, features = ["rust-embed"] }

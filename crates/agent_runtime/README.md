@@ -8,8 +8,10 @@ dedicated Tokio `LocalSet`, with SQLite ownership separate from GPUI.
 
 The runtime executes actual Infinity steps against durable SQLite stores. It is
 a workspace library, not a separate daemon, external ACP agent, or cloud service.
-`NativeAgentServer` does not yet instantiate it. The existing native agent loop
-continues to run normally, using the new owned completion preparation boundary.
+`NativeAgentServer` attaches an app-owned `NativeRuntime` host to native
+connections. The host starts its database and worker lazily through its native
+API. The existing interactive agent loop continues to run normally, using the
+owned completion preparation boundary; the panel does not submit to Infinity yet.
 The complete K1–K7 and N1–N10 integration is not finished by this change.
 
 Implemented foundations:
@@ -30,11 +32,50 @@ Implemented foundations:
 - Paginated agent metadata queries and fixed parent history references.
 - Completed-response guards around Infinity's step API. Partial inference is not
   a durable execution checkpoint.
+- A bounded preparation bridge to Zed's registered model providers. Requests use
+  the existing provider configuration, credentials and provider-side limits.
+- Root and subagent model selection, profile model defaults, supported thinking,
+  effort, speed, temperature and output limits from Zed's existing settings.
+- Native app ownership independent of view handles, synchronous quit cancellation
+  and a shared shutdown result for concurrent shutdown callers.
 
-`PreparedLanguageModelCompletion` in `language_model_core` is the initial shared
-provider execution seam. Zed still owns provider preparation and configuration;
-an owned execution can cross threads. This is not yet the full provider-to-Infinity
-request, capability and stream conversion layer.
+`PreparedLanguageModelCompletion` in `language_model_core` is the shared provider
+execution seam. Zed resolves configuration on the foreground executor; the owned
+execution and stream are polled on the runtime worker. Only admitted slices have
+preparation requests, and both host queues have a fixed capacity of 256.
+
+## Native host API and provider coverage
+
+`NativeAgentConnection::runtime` exposes the shared host. Call
+`NativeRuntime::start_database(path, limits, cx)` before `submit_text(config, text)`.
+The native API returns the run ID and exposes the existing store operations and
+bounded runtime notices. Repeated startup accepts the same path and limits and
+rejects another database/configuration. Opening the database happens off the UI
+thread. Recovered agents remain paused; starting the host does not resume them.
+
+`NativeRuntimeConfig` persists model/profile identifiers and an assembled system
+prompt, without credentials. The caller must use the existing project instruction
+and skill loaders to assemble that prompt. This batch applies profile model
+defaults, not profile tool permissions. Children inherit the run prompt and use
+Zed's configured subagent model when set. Explicit unavailable models fail; they
+never silently fall back to another provider. AI-disable settings are checked
+both at configuration resolution and provider preparation.
+
+The bridge supports text, JSON function calls and correlated results, base64 PNG
+images, plain/signed thinking, redacted thinking, and token usage. Complete tool
+arguments are emitted once. A stop event alone is insufficient to checkpoint:
+the native stream must finish successfully, including any usage events after
+stop. Raw usage/status events can be observed; cache-creation usage is combined
+with input usage in Infinity's narrower usage structure. Durable native usage
+accounting and the panel projection remain integration work.
+
+Unrepresentable fields fail explicitly: provider reasoning details/IDs, tool
+thought signatures, compaction, custom text tool input, distinct secondary call
+IDs, image URLs and non-PNG images. These need protocol extensions or authorized
+conversion before full provider parity. The bridge bounds retained output to
+8 MiB and 256 tool calls per response. Unsupported state, incomplete streams,
+provider errors and truncated/refused output pause the agent without committing
+partial inference. Dropping a slice drops the original Zed provider stream.
 
 ## Execution and recovery
 
@@ -68,10 +109,10 @@ Zed job adapter; no process executor is installed here yet.
 
 ## Remaining integration gates
 
-1. Connect the runtime owner to the app lifecycle and native connection facade,
-   with configured model selection, error presentation and permission handling.
-2. Convert Zed and Infinity requests and stream events without losing provider
-   capabilities, multimodal data, usage, reasoning or cancellation semantics.
+1. Connect panel submissions and error presentation to the native runtime API
+   after permission handling and bounded UI projections are available.
+2. Extend the protocol for the unsupported provider fields above, preserve full
+   usage accounting, and verify every supported provider end to end.
 3. Bind existing independent tools and narrow project, buffer and LSP bridges to
    the durable job broker. Preserve instruction, skill, MCP and approval behavior.
 4. Add parent reports and dependency joins. Existing child IDs and inherited
@@ -88,9 +129,15 @@ Zed job adapter; no process executor is installed here yet.
 
 ```sh
 cargo test -p agent_runtime -p language_model_core --lib
+cargo test -p agent --lib native_runtime::tests
 ./script/clippy -p agent_runtime
 cargo test -p agent_runtime large_parked_fleet_uses_paged_metadata -- --ignored --nocapture
 ```
+
+Native integration tests drive Zed's fake registered provider through the actual
+Infinity worker and SQLite store. They cover detached handles, configured root
+and subagent models, provider-state rejection, and app-quit cancellation with a
+paused reopen. No live model credentials or paid requests are used.
 
 The explicit capacity test seeds 75,000 parked metadata records and checks bounded
 pagination, idle admission and enforcement of the total-agent limit. It does not

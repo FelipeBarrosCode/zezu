@@ -1,11 +1,12 @@
 mod infinity;
+pub mod model;
 mod runtime;
 mod store;
 #[cfg(test)]
 mod tests;
 
 pub use infinity::{InfinitySlice, SqliteInfinityStore};
-pub use runtime::{EmbeddedRuntime, RuntimeNotice, SliceFactory};
+pub use runtime::{EmbeddedRuntime, RuntimeNotice, RuntimeNoticeReceiver, SliceFactory};
 pub use store::{
     AgentPage, AgentSnapshot, Job, JobRecovery, JobState, Lease, RuntimeStore, SliceOutcome,
 };
@@ -13,7 +14,7 @@ pub use store::{
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RuntimeLimits {
     pub max_agents_per_run: usize,

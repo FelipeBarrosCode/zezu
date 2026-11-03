@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     fmt,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -31,6 +31,19 @@ use crate::{
     Lease, RuntimeStore, SliceOutcome,
     store::{check_lease, spawn_child},
 };
+
+impl RuntimeStore {
+    pub async fn enqueue_text_input(
+        &self,
+        agent_id: String,
+        message_id: String,
+        text: String,
+    ) -> Result<bool> {
+        let input = InputMessage::user_text(agent_id.clone(), text);
+        self.enqueue_user_input(agent_id, message_id, serde_json::to_value(input)?)
+            .await
+    }
+}
 
 #[derive(Debug)]
 pub struct StoreError(anyhow::Error);
@@ -561,6 +574,7 @@ impl InputSender for SqliteInfinityStore {
 struct CompletedResponseProvider {
     provider: Arc<dyn ModelProvider>,
     complete: Arc<AtomicBool>,
+    failure: Arc<OnceLock<String>>,
 }
 
 #[async_trait]
@@ -582,15 +596,17 @@ impl ModelProvider for CompletedResponseProvider {
             .invoke_model(model, request)
             .await
             .map_err(|error| {
+                self.failure.get_or_init(|| error.to_string());
                 CompletionError::provider(
                     infinity_provider_protocol::ErrorClass::Fatal,
                     error.to_string(),
                 )
             })?;
         let complete = self.complete.clone();
+        let failure = self.failure.clone();
         Ok(futures::stream::unfold(
-            (stream, false, complete),
-            |(mut stream, ended, complete)| async move {
+            (stream, false, complete, failure),
+            |(mut stream, ended, complete, failure)| async move {
                 if ended {
                     return None;
                 }
@@ -603,6 +619,7 @@ impl ModelProvider for CompletedResponseProvider {
                     Some(Ok(chunk)) => (Ok(chunk), false),
                     Some(Err(error)) => {
                         complete.store(false, Ordering::Release);
+                        failure.get_or_init(|| error.to_string());
                         (
                             Err(CompletionError::provider(
                                 infinity_provider_protocol::ErrorClass::Fatal,
@@ -611,16 +628,20 @@ impl ModelProvider for CompletedResponseProvider {
                             true,
                         )
                     }
-                    None if !complete.load(Ordering::Acquire) => (
-                        Err(CompletionError::provider(
-                            infinity_provider_protocol::ErrorClass::Fatal,
-                            "model stream ended without a final response",
-                        )),
-                        true,
-                    ),
+                    None if !complete.load(Ordering::Acquire) => {
+                        let message = "model stream ended without a final response";
+                        failure.get_or_init(|| message.to_owned());
+                        (
+                            Err(CompletionError::provider(
+                                infinity_provider_protocol::ErrorClass::Fatal,
+                                message,
+                            )),
+                            true,
+                        )
+                    }
                     None => return None,
                 };
-                Some((chunk, (stream, ended, complete)))
+                Some((chunk, (stream, ended, complete, failure)))
             },
         )
         .boxed())
@@ -678,9 +699,11 @@ impl InfinitySlice {
         observer: &O,
     ) -> Result<()> {
         let complete = Arc::new(AtomicBool::new(false));
+        let failure = Arc::new(OnceLock::new());
         let provider = Arc::new(CompletedResponseProvider {
             provider: self.provider.clone(),
             complete: complete.clone(),
+            failure: failure.clone(),
         });
         let backend = SqliteInfinityStore {
             store: store.clone(),
@@ -717,10 +740,14 @@ impl InfinitySlice {
             .iter()
             .map(|(id, payload)| Ok((serde_json::from_value(payload.clone())?, id.clone())))
             .collect::<Result<Vec<(InputMessage, String)>>>()?;
-        let outcomes = system
-            .step(inputs, observer, &mut NoDeferral)
-            .await
-            .map_err(|error| anyhow::anyhow!("Infinity slice failed: {error}"))?;
+        let outcomes = system.step(inputs, observer, &mut NoDeferral).await;
+        // Infinity reports provider failures through observer events before its commit barrier.
+        // Retain the cause when that barrier rejects the incomplete response.
+        if let Some(error) = failure.get() {
+            anyhow::bail!("model completion failed: {error}");
+        }
+        let outcomes =
+            outcomes.map_err(|error| anyhow::anyhow!("Infinity slice failed: {error}"))?;
         for (_, outcome) in outcomes {
             if matches!(outcome, StepOutcome::Completed { .. }) {
                 ensure!(
