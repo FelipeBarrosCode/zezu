@@ -6,7 +6,7 @@ use fs::Fs;
 use gpui::{App, Entity, Task};
 use project::{AgentId, Project};
 
-use crate::{NativeAgent, NativeAgentConnection, ThreadStore, templates::Templates};
+use crate::{NativeAgent, NativeAgentConnection, NativeRuntime, ThreadStore, templates::Templates};
 
 #[derive(Clone)]
 pub struct NativeAgentServer {
@@ -43,7 +43,12 @@ impl AgentServer for NativeAgentServer {
             let templates = Templates::new();
 
             log::debug!("Creating native agent entity");
-            let agent = cx.update(|cx| NativeAgent::new(thread_store, templates, fs, cx));
+            let agent = cx.update(|cx| {
+                let runtime = NativeRuntime::global(cx)?;
+                let agent = NativeAgent::new(thread_store, templates, fs, cx);
+                agent.update(cx, |agent, _| agent.runtime = Some(runtime));
+                anyhow::Ok(agent)
+            })?;
 
             // Create the connection wrapper
             let connection = NativeAgentConnection(agent);

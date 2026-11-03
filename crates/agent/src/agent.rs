@@ -1,6 +1,7 @@
 mod db;
 mod legacy_thread;
 mod native_agent_server;
+mod native_runtime;
 pub mod outline;
 mod pattern_extraction;
 mod sandboxing;
@@ -16,6 +17,7 @@ use context_server::ContextServerId;
 pub use db::*;
 use itertools::Itertools;
 pub use native_agent_server::NativeAgentServer;
+pub use native_runtime::{NativeRuntime, NativeRuntimeConfig};
 use parking_lot::Mutex;
 pub use pattern_extraction::*;
 pub use sandboxing::{
@@ -539,6 +541,7 @@ pub trait SiblingThreadHost {
 }
 
 pub struct NativeAgent {
+    runtime: Option<Entity<NativeRuntime>>,
     /// Session ID -> Session mapping
     sessions: HashMap<acp_v2::SessionId, Session>,
     pending_sessions: HashMap<acp_v2::SessionId, PendingSession>,
@@ -717,6 +720,7 @@ impl NativeAgent {
             }
 
             Self {
+                runtime: None,
                 sessions: HashMap::default(),
                 pending_sessions: HashMap::default(),
                 thread_store,
@@ -2405,6 +2409,10 @@ impl NativeAgent {
 pub struct NativeAgentConnection(pub Entity<NativeAgent>);
 
 impl NativeAgentConnection {
+    pub fn runtime(&self, cx: &App) -> Option<Entity<NativeRuntime>> {
+        self.0.read(cx).runtime.clone()
+    }
+
     pub fn thread(&self, session_id: &acp_v2::SessionId, cx: &App) -> Option<Entity<Thread>> {
         self.0
             .read(cx)

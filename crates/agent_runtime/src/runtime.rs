@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Context as _, Result, anyhow};
 use futures::{
     FutureExt as _, StreamExt as _,
-    future::{AbortHandle, Abortable, BoxFuture, LocalBoxFuture},
+    future::{AbortHandle, Abortable, BoxFuture, LocalBoxFuture, Shared},
     stream::FuturesUnordered,
 };
 use infinity_agent_core::{
@@ -28,9 +28,18 @@ pub struct RuntimeNotice {
     pub error: Option<String>,
 }
 
+pub type RuntimeNoticeReceiver = broadcast::Receiver<RuntimeNotice>;
+
 struct Owner {
     stop: watch::Sender<bool>,
-    worker: Mutex<Option<JoinHandle<Result<()>>>>,
+    worker: Mutex<WorkerState>,
+}
+
+type Shutdown = Shared<BoxFuture<'static, Result<(), String>>>;
+
+struct WorkerState {
+    thread: Option<JoinHandle<Result<()>>>,
+    shutdown: Option<Shutdown>,
 }
 
 #[derive(Clone)]
@@ -89,40 +98,61 @@ impl EmbeddedRuntime {
             store,
             owner: Arc::new(Owner {
                 stop,
-                worker: Mutex::new(Some(worker)),
+                worker: Mutex::new(WorkerState {
+                    thread: Some(worker),
+                    shutdown: None,
+                }),
             }),
             notices,
         })
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<RuntimeNotice> {
+    pub fn subscribe(&self) -> RuntimeNoticeReceiver {
         self.notices.subscribe()
     }
 
-    pub async fn shutdown(&self) -> Result<()> {
+    pub fn request_shutdown(&self) {
         self.owner.stop.send_replace(true);
-        let worker = self
-            .owner
-            .worker
-            .lock()
-            .map_err(|_| anyhow!("runtime owner poisoned"))?
-            .take();
-        if let Some(worker) = worker {
-            let (reply, response) = futures::channel::oneshot::channel();
-            std::thread::Builder::new()
-                .name("agent-runtime-join".into())
-                .spawn(move || {
-                    let result = worker
-                        .join()
-                        .map_err(|_| anyhow!("runtime worker panicked"))
-                        .and_then(|result| result);
-                    if let Err(Err(error)) = reply.send(result) {
-                        log::error!("abandoned runtime shutdown failed: {error:#}");
-                    }
-                })?;
-            response.await.context("runtime join task failed")??;
-        }
-        Ok(())
+    }
+
+    pub async fn shutdown(&self) -> Result<()> {
+        self.request_shutdown();
+        let shutdown = {
+            let mut state = self
+                .owner
+                .worker
+                .lock()
+                .map_err(|_| anyhow!("runtime owner poisoned"))?;
+            if let Some(shutdown) = &state.shutdown {
+                shutdown.clone()
+            } else {
+                let worker = state.thread.take().context("runtime worker is missing")?;
+                let (reply, response) = futures::channel::oneshot::channel();
+                let join = std::thread::Builder::new()
+                    .name("agent-runtime-join".into())
+                    .spawn(move || {
+                        let result = worker
+                            .join()
+                            .map_err(|_| anyhow!("runtime worker panicked"))
+                            .and_then(|result| result);
+                        if let Err(Err(error)) = reply.send(result) {
+                            log::error!("abandoned runtime shutdown failed: {error:#}");
+                        }
+                    });
+                let shutdown = async move {
+                    join.map_err(|error| error.to_string())?;
+                    response
+                        .await
+                        .map_err(|error| format!("runtime join task failed: {error}"))?
+                        .map_err(|error| format!("{error:#}"))
+                }
+                .boxed()
+                .shared();
+                state.shutdown = Some(shutdown.clone());
+                shutdown
+            }
+        };
+        shutdown.await.map_err(|error| anyhow!(error))
     }
 }
 

@@ -36,6 +36,28 @@ fn store_operations_do_not_require_a_tokio_caller() -> Result<()> {
 }
 
 #[tokio::test]
+async fn concurrent_shutdown_callers_wait_for_the_same_checkpoint() -> Result<()> {
+    use futures::FutureExt as _;
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("runtime.sqlite");
+    let store = RuntimeStore::open(&path, RuntimeLimits::default())?;
+    store
+        .create_root("root".into(), json!({"configuration": "retained"}))
+        .await?;
+    let runtime = EmbeddedRuntime::start(store, Arc::new(|_| futures::future::pending().boxed()))?;
+    let (first, second) = futures::join!(runtime.shutdown(), runtime.shutdown());
+    first?;
+    second?;
+    let restored = RuntimeStore::open(path, RuntimeLimits::default())?;
+    assert_eq!(
+        restored.metadata("root".into()).await?,
+        json!({"configuration": "retained"})
+    );
+    assert_eq!(restored.snapshot("root".into()).await?.state, "paused");
+    restored.shutdown().await
+}
+
+#[tokio::test]
 async fn reconciliation_requires_a_verified_outcome_before_retry() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("runtime.sqlite");

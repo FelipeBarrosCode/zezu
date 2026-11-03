@@ -252,6 +252,21 @@ impl RuntimeStore {
         .await
     }
 
+    pub async fn metadata(&self, agent_id: String) -> Result<Value> {
+        self.read(move |connection| {
+            let metadata: Option<String> = connection.query_row(
+                "SELECT metadata FROM agents WHERE id=?",
+                [&agent_id],
+                |row| row.get(0),
+            )?;
+            Ok(metadata
+                .map(|value| serde_json::from_str(&value))
+                .transpose()?
+                .unwrap_or(Value::Null))
+        })
+        .await
+    }
+
     pub async fn spawn_child(
         &self,
         parent: String,
