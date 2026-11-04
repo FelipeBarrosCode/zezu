@@ -254,7 +254,7 @@ impl Orchestrator {
             let active: bool = transaction.query_row("SELECT state='running' FROM agents WHERE id=?", [&task.agent_id], |row| row.get(0))?;
             ensure!(!active, "complete the active inference slice before reporting its task result");
             if let Some(job) = &job {
-                let input = tool_result_input(job, serde_json::json!({"reported":true}), false)?;
+                let input = crate::orchestration_tools::tool_result_input(job, serde_json::json!({"reported":true}), false)?;
                 let changed = transaction.execute("UPDATE jobs SET state='completed',result=? WHERE id=? AND agent_id=? AND generation=? AND state='dispatched'", params![serde_json::to_string(&input)?,job.id,task.agent_id,task.generation])?;
                 ensure!(changed == 1, "task report job is not currently dispatched");
             }
@@ -634,36 +634,4 @@ mod tests {
         assert_eq!(store.admit().await?.context("resumed")?.agent_id, "root");
         store.shutdown().await
     }
-}
-
-fn tool_result_input(job: &crate::Job, result: Value, is_error: bool) -> Result<InputMessage> {
-    let id = job
-        .payload
-        .get("tool_call_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("job tool call id"))?;
-    let call_id = job
-        .payload
-        .get("provider_call_id")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let text = serde_json::to_string(&serde_json::json!({"is_error":is_error,"result":result}))?;
-    Ok(InputMessage {
-        content: infinity_agent_core::message::InputMessageContent::User(
-            infinity_provider_protocol::UserContent::ToolResult(
-                infinity_provider_protocol::ToolResult {
-                    id: id.into(),
-                    call_id,
-                    content: vec![infinity_provider_protocol::ToolResultContent::text(text)],
-
-                    ..Default::default()
-                },
-            ),
-        ),
-        group_id: job.agent_id.clone().into(),
-        metadata: None,
-        synthetic: None,
-        display_as: None,
-        subscription: false,
-    })
 }
