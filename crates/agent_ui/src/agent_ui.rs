@@ -1066,6 +1066,7 @@ mod tests {
         });
 
         let agent_settings = AgentSettings {
+            runtime: Default::default(),
             enabled: true,
             button: true,
             dock: DockPosition::Right,

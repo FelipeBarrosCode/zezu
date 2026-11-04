@@ -327,6 +327,7 @@ impl RuntimeStore {
     pub async fn begin_compaction(&self, agent: String) -> Result<i64> {
         self.write(move |connection| {
             let transaction = connection.transaction()?;
+            crate::configuration::ensure_scope_unlocked(&transaction,&agent)?;
             let changed = transaction.execute("UPDATE agents SET state='paused',pause_requested=1,generation=generation+1,lease_id=NULL WHERE id=? AND state NOT IN ('cancelled','completed','failed')", [&agent])?;
             ensure!(changed == 1, "no active conversation to compact");
             crate::orchestration::Orchestrator::rebind_task(&transaction,&agent)?;
