@@ -7,7 +7,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: zezu-test-apps-${{ github.ref }}
+  group: zezu-test-apps-${{ github.ref }}-${{ github.sha }}
   cancel-in-progress: false
 jobs:
   package:
@@ -56,6 +56,20 @@ jobs:
           git rev-parse HEAD > BUILD-COMMIT.txt
           git rev-parse HEAD^{tree} >> BUILD-COMMIT.txt
           rustup show
+      - name: Restore Rust dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          shared-key: zezu-test-${{ matrix.target }}
+          key: ${{ hashFiles('.cargo/bundle-config.toml', 'script/bundle-mac', 'script/bundle-linux', 'script/bundle-windows.ps1') }}
+          workspaces: ". -> target"
+          cache-on-failure: true
+          cache-workspace-crates: false
+      - name: Restore WASI SDK
+        id: wasi-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: target/wasi-sdk
+          key: wasi-sdk-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('script/download-wasi-sdk') }}
       - name: Linux build dependencies
         if: matrix.platform == 'linux'
         run: |
@@ -82,6 +96,14 @@ jobs:
       - name: Download WASI SDK
         shell: bash
         run: ./script/download-wasi-sdk
+      # Save immediately: this SDK is needed even when a later compile fails,
+      # and Rust cache cleanup removes non-Cargo files from target.
+      - name: Save WASI SDK
+        if: steps.wasi-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: target/wasi-sdk
+          key: wasi-sdk-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('script/download-wasi-sdk') }}
       - name: Bundle macOS app
         if: matrix.platform == 'mac'
         env:
