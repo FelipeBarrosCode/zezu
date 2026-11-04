@@ -1,0 +1,150 @@
+name: Zezu test apps
+on:
+  push:
+    branches: [codex/test-app-builds]
+    paths: [.github/workflows/zezu-test-apps.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: zezu-test-apps-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  package:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS Apple Silicon
+            runner: macos-26
+            platform: mac
+            target: aarch64-apple-darwin
+            artifact: zezu-macos-apple-silicon
+          - name: macOS Intel
+            runner: macos-26-intel
+            platform: mac
+            target: x86_64-apple-darwin
+            artifact: zezu-macos-intel
+          - name: Windows x64
+            runner: windows-2022
+            platform: windows
+            target: x86_64-pc-windows-msvc
+            artifact: zezu-windows-x64
+          - name: Linux x64
+            runner: ubuntu-24.04
+            platform: linux
+            target: x86_64-unknown-linux-gnu
+            artifact: zezu-linux-x64
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_RELEASE_DEBUG: '0'
+      CARGO_PROFILE_RELEASE_LTO: 'false'
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Record tested source
+        shell: bash
+        run: |
+          git rev-parse HEAD > BUILD-COMMIT.txt
+          git rev-parse HEAD^{tree} >> BUILD-COMMIT.txt
+          rustup show
+      - name: Linux build dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          ./script/linux
+      - name: macOS build dependencies
+        if: matrix.platform == 'mac'
+        run: |
+          brew install cmake || brew upgrade cmake
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
+      - name: Windows build dependencies
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe" -latest -products '*' -property installationPath
+          if (-not $vs) { throw 'Visual Studio is required' }
+          $community = 'C:/Program Files/Microsoft Visual Studio/2022/Community'
+          if (-not (Test-Path $community)) { New-Item -ItemType Junction -Path $community -Target $vs }
+          $installer = "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/setup.exe"
+          $process = Start-Process -FilePath $installer -ArgumentList @('modify','--installPath',('"'+$vs+'"'),'--add','Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre','--quiet','--norestart') -Wait -PassThru
+          if ($process.ExitCode -notin @(0,3010)) { throw "VS component installation failed: $($process.ExitCode)" }
+          if (-not (Test-Path 'C:/Program Files (x86)/Inno Setup 6/ISCC.exe')) { choco install innosetup --yes --no-progress }
+      - name: Download WASI SDK
+        shell: bash
+        run: ./script/download-wasi-sdk
+      - name: Bundle macOS app
+        if: matrix.platform == 'mac'
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+        run: ./script/bundle-mac "$BUILD_TARGET"
+      - name: Bundle Linux app
+        if: matrix.platform == 'linux'
+        env:
+          CC: clang-18
+          CXX: clang++-18
+          LLD: /usr/bin/ld.lld-18
+        run: ./script/bundle-linux --skip-sentry
+      - name: Bundle Windows app
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: ./script/bundle-windows.ps1 -Architecture x86_64
+      - name: Verify packaged app
+        shell: bash
+        env:
+          BUILD_PLATFORM: ${{ matrix.platform }}
+          BUILD_TARGET: ${{ matrix.target }}
+        run: |
+          case "$BUILD_PLATFORM" in
+            mac) find "target/$BUILD_TARGET/release" -maxdepth 1 -name 'Zed-*.dmg' -size +0c | grep . ;;
+            linux) test -s target/release/zed-linux-x86_64.tar.gz ;;
+            windows) test -s target/Zed-x86_64.exe ;;
+          esac
+      - name: Upload macOS DMG
+        if: matrix.platform == 'mac'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            target/${{ matrix.target }}/release/Zed-*.dmg
+            BUILD-COMMIT.txt
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload Linux archive
+        if: matrix.platform == 'linux'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            target/release/zed-linux-x86_64.tar.gz
+            BUILD-COMMIT.txt
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload Windows installer
+        if: matrix.platform == 'windows'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            target/Zed-x86_64.exe
+            BUILD-COMMIT.txt
+          if-no-files-found: error
+          retention-days: 14
+      - name: Build summary
+        if: always()
+        shell: bash
+        env:
+          BUILD_PLATFORM: ${{ matrix.name }}
+        run: |
+          echo "### $BUILD_PLATFORM" >> "$GITHUB_STEP_SUMMARY"
+          echo "Source: $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          echo 'Unsigned development build; download its artifact after the packaging step succeeds.' >> "$GITHUB_STEP_SUMMARY"
