@@ -1,0 +1,64 @@
+---
+source: crates/infinity_agent_core/src/event_processor.rs
+assertion_line: 2784
+expression: hm.history.into_inner()
+---
+[
+  {
+    "kind": "user",
+    "content": {
+      "type": "text",
+      "text": "run command"
+    }
+  },
+  {
+    "kind": "tool_call",
+    "call": {
+      "id": "tc-cmd",
+      "function": {
+        "name": "execute_command",
+        "arguments": {
+          "command": "make build"
+        }
+      }
+    }
+  },
+  {
+    "kind": "tool_result",
+    "result": {
+      "id": "tc-cmd",
+      "content": [
+        {
+          "type": "text",
+          "text": "Command is still running. Output will be streamed via subscription events."
+        }
+      ]
+    }
+  },
+  {
+    "kind": "subscription_event",
+    "result": {
+      "id": "[uuid]",
+      "content": [
+        {
+          "type": "text",
+          "text": "build output chunk\n[exit code: 0]"
+        }
+      ]
+    },
+    "tool_call_id": "tc-cmd",
+    "invocation": {
+      "id": "[uuid]",
+      "function": {
+        "name": "receive_event__injected",
+        "arguments": {
+          "original_tool_name": "execute_command",
+          "original_tool_call_id": "tc-cmd",
+          "original_args": {
+            "command": "make build"
+          }
+        }
+      }
+    }
+  }
+]

@@ -1,0 +1,30 @@
+[package]
+name = "infinity-provider-protocol"
+version = "0.2.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/hydro-project/infinity"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+async-trait = "0.1"
+futures-util = "0.3"
+async-stream = { version = "0.3", optional = true }
+tokio = { version = "1", features = ["sync"], optional = true }
+tokio-util = { version = "0.7", features = ["codec"], optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
+tracing = { version = "0.1", optional = true }
+
+[features]
+mock = ["dep:tokio", "dep:async-stream"]
+remote = ["dep:tokio", "tokio/net", "tokio/rt", "tokio/time", "dep:tokio-util", "dep:uuid", "dep:async-stream", "dep:tracing", "futures-util/sink"]
+
+[dev-dependencies]
+infinity-provider-protocol = { path = ".", features = ["mock", "remote"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

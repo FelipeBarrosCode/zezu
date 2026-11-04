@@ -138,6 +138,7 @@ impl RuntimeStore {
             "unsupported runtime database version: {version}"
         );
         crate::jobs::initialize_connection(&connection)?;
+        crate::compaction::initialize(&connection)?;
         crate::input_batches::initialize(&connection)?;
         crate::projection::initialize(&connection)?;
         recover(&mut connection)?;

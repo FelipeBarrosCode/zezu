@@ -1,0 +1,132 @@
+//! Channel-based mock completion model for testing (feature `mock`).
+//!
+//! Call [`mock_model()`] to get a `(MockCompletionModel, MockModelController)`
+//! pair. The model is passed to production code (usually wrapped in a
+//! [`SingleModelProvider`](crate::SingleModelProvider)); the controller
+//! drives it from the test.
+
+use async_trait::async_trait;
+use tokio::sync::mpsc;
+
+use crate::{
+    CompletionError, CompletionModel, CompletionRequest, FinalResponse, ModelStream, StreamChunk,
+    ToolCall, Usage,
+};
+
+// ── Internal handshake ──
+
+/// Sent from the model to the controller for each `stream()` call.
+struct StreamRound {
+    request: CompletionRequest,
+    /// Controller sends chunks through here; model reads them.
+    chunk_tx: mpsc::UnboundedSender<Result<StreamChunk, CompletionError>>,
+}
+
+// ── MockCompletionModel ──
+
+#[derive(Clone)]
+pub struct MockCompletionModel {
+    round_tx: mpsc::UnboundedSender<StreamRound>,
+}
+
+#[async_trait]
+impl CompletionModel for MockCompletionModel {
+    async fn stream(&self, request: CompletionRequest) -> Result<ModelStream, CompletionError> {
+        let (chunk_tx, mut chunk_rx) = mpsc::unbounded_channel();
+
+        // Notify controller of this round.
+        let _ = self.round_tx.send(StreamRound { request, chunk_tx });
+
+        // Build a stream that reads from the channel.
+        let stream = async_stream::stream! {
+            while let Some(item) = chunk_rx.recv().await {
+                yield item;
+            }
+        };
+
+        Ok(Box::pin(stream))
+    }
+}
+
+// ── MockModelController ──
+
+/// Test-side handle for driving the mock model.
+pub struct MockModelController {
+    round_rx: mpsc::UnboundedReceiver<StreamRound>,
+    /// Sender for the current active round (set after `next_request`).
+    current_tx: Option<mpsc::UnboundedSender<Result<StreamChunk, CompletionError>>>,
+}
+
+impl MockModelController {
+    /// Wait for the next `stream()` call and return the request.
+    pub async fn next_request(&mut self) -> CompletionRequest {
+        let round = self.round_rx.recv().await.expect("model dropped");
+        self.current_tx = Some(round.chunk_tx);
+        round.request
+    }
+
+    /// Non-blocking attempt to get the next request. Returns `None` if no
+    /// request is pending.
+    pub fn try_next_request(&mut self) -> Option<CompletionRequest> {
+        match self.round_rx.try_recv() {
+            Ok(round) => {
+                self.current_tx = Some(round.chunk_tx);
+                Some(round.request)
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// Send a raw streaming chunk.
+    pub fn send_chunk(&self, chunk: StreamChunk) {
+        self.tx().send(Ok(chunk)).ok();
+    }
+
+    /// Send a text chunk.
+    pub fn send_text(&self, text: &str) {
+        self.send_chunk(StreamChunk::Text(text.to_owned()));
+    }
+
+    /// Send a complete tool call.
+    pub fn send_tool_call(&self, id: &str, name: &str, args: serde_json::Value) {
+        self.send_chunk(StreamChunk::ToolCall(ToolCall::new(id, name, args)));
+    }
+
+    /// Send the final response marker and drop the sender to close the stream.
+    pub fn finish(&mut self) {
+        self.finish_with_usage(None);
+    }
+
+    /// Send the final response marker with custom token usage and drop the sender.
+    pub fn finish_with_usage(&mut self, usage: Option<Usage>) {
+        self.send_chunk(StreamChunk::Final(FinalResponse { usage }));
+        self.current_tx.take(); // drop closes the channel
+    }
+
+    /// Drop the stream sender without sending a Final marker.
+    /// Simulates an unexpected stream termination (e.g. network error).
+    pub fn drop_stream(&mut self) {
+        self.current_tx.take();
+    }
+
+    /// Inject a stream error.
+    pub fn send_error(&self, err: CompletionError) {
+        self.tx().send(Err(err)).ok();
+    }
+
+    fn tx(&self) -> &mpsc::UnboundedSender<Result<StreamChunk, CompletionError>> {
+        self.current_tx.as_ref().expect("call next_request() first")
+    }
+}
+
+/// Create a mock model / controller pair.
+pub fn mock_model() -> (MockCompletionModel, MockModelController) {
+    let (round_tx, round_rx) = mpsc::unbounded_channel();
+    (
+        MockCompletionModel { round_tx },
+        MockModelController {
+            round_rx,
+            current_tx: None,
+        },
+    )
+}

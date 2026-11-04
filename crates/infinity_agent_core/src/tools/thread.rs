@@ -1,0 +1,691 @@
+use async_trait::async_trait;
+use infinity_provider_protocol::message::{Text, ToolResult, ToolResultContent, UserContent};
+use rap_protocol::ThreadId;
+use tracing;
+
+use super::{Tool, ToolContext, send_tool_error};
+use crate::message::{
+    InfinityMessage, InputMessage, InputMessageContent, SyntheticKind, TaggedSyntheticKind,
+};
+use crate::traits::{ConversationStore, InputSender, SpawnContext};
+use rap_client::http::HttpClient;
+use rap_client::notifier::RapNotifier;
+
+/// Tool that spawns a new child thread and returns its ID.
+pub struct SpawnThreadTool<C: ConversationStore> {
+    pub conversation_store: C,
+}
+
+#[async_trait]
+impl<M: InputSender + 'static, C: ConversationStore + 'static> Tool<M> for SpawnThreadTool<C> {
+    fn name(&self) -> &str {
+        "spawn_thread"
+    }
+
+    fn description(&self) -> &str {
+        "Spawn a new child thread for a sub-task. By default the new thread inherits the conversation context of the current thread and will see its tasks automatically. Pass fresh_context: true to spawn a subagent WITHOUT the inherited context. Returns the new thread ID."
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "instructions": {
+                    "type": "string",
+                    "description": "Instructions for the spawned thread describing what it should do. Make sure to include in the instructions what **you plan to do while the thread runs** to make sure the child thread doesn't accidentally duplicate your work."
+                },
+                "child_of": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "The thread stack that you are spawning from, used for validation. Pass the full thread stack from root to current thread. For example, if you are the root thread 'R', pass [\"R\"]. If you are child 'A' of root 'R', pass [\"R\", \"A\"]."
+                },
+                "fresh_context": {
+                    "type": "boolean",
+                    "description": "If true, the child thread starts with a FRESH (empty) context: it does NOT inherit the conversation history of this thread or its ancestors. Use this for independent sub-tasks where the accumulated context would be irrelevant or distracting. The instructions must then be fully self-contained: include all relevant file paths, IDs, requirements, and background the child needs. Defaults to false (full context inheritance)."
+                }
+            },
+            "required": ["instructions", "child_of"]
+        })
+    }
+
+    async fn execute(
+        &self,
+        _args: serde_json::Value,
+        _id: rap_protocol::ToolCallId,
+        _call_id: Option<rap_protocol::ProviderCallId>,
+        _context: &ToolContext<M>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+
+    fn supports_sync(&self) -> bool {
+        true
+    }
+
+    async fn execute_synchronous(
+        &self,
+        args: &serde_json::Value,
+        id: &rap_protocol::ToolCallId<str>,
+        call_id: Option<&rap_protocol::ProviderCallId<str>>,
+        context: &ToolContext<M>,
+    ) -> Option<ToolResult> {
+        // Validate child_of matches the actual thread stack
+        let child_of: Vec<ThreadId> = args
+            .get("child_of")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+
+        if child_of != context.thread_stack {
+            return Some(ToolResult {
+                id: id.as_str().to_owned(),
+                call_id: call_id.map(|c| c.as_str().to_owned()),
+                content: vec![ToolResultContent::Text(Text {
+                    text: format!(
+                        "Error: child_of {:?} does not match the actual thread stack {:?}. You may be confused and think you are in the parent thread, but you are not. You are in thread {}. Do NOT spawn threads — focus on your assigned task.",
+                        child_of, context.thread_stack, context.group_id
+                    ),
+                })],
+
+                ..Default::default()
+            });
+        }
+
+        let error_result = |text: String| {
+            Some(ToolResult {
+                id: id.as_str().to_owned(),
+                call_id: call_id.map(|c| c.as_str().to_owned()),
+                content: vec![ToolResultContent::Text(Text { text })],
+
+                ..Default::default()
+            })
+        };
+
+        let fresh_context = args
+            .get("fresh_context")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        // Spawn the child right *before* the spawn call and give the child
+        // its own copy of the call (seeded below), instead of letting the
+        // child see the parent's copy through its inherited slice. The child
+        // then owns the call its seed instructions (and later parent
+        // messages) resolve against, even after the parent's copy — or the
+        // child's inherited prefix — is folded into a compaction summary.
+        let spawn_context = if fresh_context {
+            SpawnContext::Fresh
+        } else {
+            // spawn_thread only executes synchronously, and the runtime
+            // always provides the safe spawn point on that path.
+            SpawnContext::InheritUpTo(context.safe_spawn_point.expect(
+                "bug: spawn_thread executed without a safe spawn point in the tool context",
+            ))
+        };
+
+        let new_thread_id = match self
+            .conversation_store
+            .spawn_thread(&context.group_id, id, false, spawn_context)
+            .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::error!("failed to spawn thread in conversation store: {e}");
+                return error_result(format!("Error: failed to spawn thread: {e}"));
+            }
+        };
+
+        tracing::info!(
+            "Spawned new thread {} from parent {} (fresh_context: {})",
+            new_thread_id,
+            context.group_id,
+            fresh_context
+        );
+
+        let instructions = args
+            .get("instructions")
+            .expect("bug: missing 'instructions' arg")
+            .as_str()
+            .expect("bug: 'instructions' arg is not a string");
+
+        // Write the child's own copy of the spawn call into its (so far
+        // empty) store, pairing with the instruction tool result sent below.
+        // Fresh threads need it because they inherit nothing; inherit
+        // threads because their cutoff excludes the parent's copy (see
+        // `spawn_context` above). The call is duplicated verbatim — same
+        // provider call_id and arguments — so the child's model-facing
+        // history is exactly what the provider originally emitted.
+        let spawn_tool_call = InfinityMessage::ToolCall {
+            call: infinity_provider_protocol::message::ToolCall {
+                id: id.as_str().to_owned(),
+                call_id: call_id.map(|c| c.as_str().to_owned()),
+                function: infinity_provider_protocol::message::ToolFunction {
+                    name: "spawn_thread".to_owned(),
+                    arguments: args.clone(),
+                },
+            },
+            display_as: None,
+        };
+        if let Err(e) = self
+            .conversation_store
+            .append_messages(
+                &new_thread_id,
+                vec![(spawn_tool_call, format!("{}-spawn-call", id))],
+            )
+            .await
+        {
+            tracing::error!("failed to seed child thread with spawn call: {e}");
+            return error_result(format!("Error: failed to seed child thread: {e}"));
+        }
+
+        let child_instructions = if fresh_context {
+            format!(
+                "You are now INSIDE a newly created thread with a FRESH context. Your thread ID is {}. You do NOT inherit any conversation history from your parent thread: the instructions above are your ONLY context, so do not assume any other background. Follow the instructions exactly. Use report_to_parent to send results to the parent, and call close_thread with your thread ID when you are done.",
+                new_thread_id
+            )
+        } else {
+            format!(
+                "You are now INSIDE the thread that you requested to create. Your thread ID is {}. Your next task is to exactly follow these instructions: {}\n. Start by repeating to yourself the instructions, ignoring thinking from the parent context. Make sure to not be confused by the parent context. If the parent was planning to spawn more threads, you should not.",
+                new_thread_id, instructions
+            )
+        };
+
+        let child_result = InputMessage {
+            content: InputMessageContent::User(UserContent::ToolResult(ToolResult {
+                id: id.as_str().to_owned(),
+                // Must match the seeded call's call_id (preserved above).
+                call_id: call_id.map(|c| c.as_str().to_owned()),
+                content: vec![ToolResultContent::Text(Text {
+                    text: child_instructions,
+                })],
+
+                ..Default::default()
+            })),
+            group_id: new_thread_id.clone(),
+            metadata: None,
+            synthetic: None,
+            display_as: None,
+            subscription: false,
+        };
+
+        context
+            .message_sender
+            .send_to_input_queue(child_result, id.as_str())
+            .await
+            .expect("failed to send child thread message to input queue");
+
+        Some(ToolResult {
+            id: id.as_str().to_owned(),
+            call_id: call_id.map(|c| c.as_str().to_owned()),
+            content: vec![ToolResultContent::Text(Text {
+                text: format!(
+                    "Child thread is successfully spawned and has ID: {}. You will be notified automatically when the child has anything to report. Make sure that you **do not** do the task assigned to the child thread.",
+                    new_thread_id
+                ),
+            })],
+
+            ..Default::default()
+        })
+    }
+}
+
+/// Tool that sends a report to the parent thread without closing the current thread.
+pub struct ReportToParentTool<C: ConversationStore> {
+    pub conversation_store: C,
+}
+
+#[async_trait]
+impl<M: InputSender + 'static, C: ConversationStore + 'static> Tool<M> for ReportToParentTool<C> {
+    fn name(&self) -> &str {
+        "report_to_parent"
+    }
+
+    fn description(&self) -> &str {
+        "Send a report to the parent thread. Use this when you have intermediate results, updates, or information the parent should know about while you continue working."
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "report": {
+                    "type": "string",
+                    "description": "The report content to send to the parent thread."
+                }
+            },
+            "required": ["report"]
+        })
+    }
+
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        id: rap_protocol::ToolCallId,
+        call_id: Option<rap_protocol::ProviderCallId>,
+        context: &ToolContext<M>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let Some(report_text) = args["report"].as_str() else {
+            return send_tool_error(context, &id, call_id, "report is required").await;
+        };
+
+        let Some((parent_id, spawn_tool_call_id)) = self
+            .conversation_store
+            .get_thread_parent_info(&context.group_id)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+        else {
+            return send_tool_error(
+                context,
+                &id,
+                call_id,
+                "No parent thread found — this is a root thread",
+            )
+            .await;
+        };
+
+        let is_subscription = self
+            .conversation_store
+            .is_subscription_event_thread(&context.group_id)
+            .await
+            .unwrap_or(false);
+
+        tracing::info!(
+            "Sending report from thread {} to parent {} via tool call {}",
+            context.group_id,
+            parent_id,
+            spawn_tool_call_id
+        );
+
+        let formatted_report = if is_subscription {
+            format!(
+                "Report from temporary child thread created to process a subscription event:\n{}",
+                report_text
+            )
+        } else {
+            format!("Report from child thread: {}", report_text)
+        };
+
+        let report_message = InputMessage {
+            content: InputMessageContent::User(UserContent::ToolResult(ToolResult {
+                id: String::new(),
+                call_id: None,
+                content: vec![ToolResultContent::Text(Text {
+                    text: formatted_report,
+                })],
+
+                ..Default::default()
+            })),
+            group_id: parent_id,
+            metadata: None,
+            synthetic: Some(SyntheticKind::Tagged(TaggedSyntheticKind::ThreadReport {
+                tool_call_id: spawn_tool_call_id,
+                child_thread_id: context.group_id.clone(),
+            })),
+            display_as: None,
+            subscription: false,
+        };
+
+        context
+            .message_sender
+            .send_to_input_queue(report_message, id.as_str())
+            .await?;
+
+        let tool_result = InputMessage {
+            content: InputMessageContent::User(UserContent::ToolResult(ToolResult {
+                id: id.clone().into_inner(),
+                call_id: call_id.map(|c| c.into_inner()),
+                content: vec![ToolResultContent::Text(Text {
+                    text: "Report sent to parent thread.".to_owned(),
+                })],
+
+                ..Default::default()
+            })),
+            group_id: context.group_id.clone(),
+            metadata: None,
+            synthetic: None,
+            display_as: None,
+            subscription: false,
+        };
+
+        context
+            .message_sender
+            .send_to_input_queue(tool_result, id.as_str())
+            .await?;
+
+        Ok(())
+    }
+}
+
+/// Tool that closes a thread, returning control to the parent.
+pub struct CloseThreadTool<C: ConversationStore, H: HttpClient> {
+    pub conversation_store: C,
+    /// Optional notifier that informs RAP tool servers about the thread closure.
+    /// Best-effort: failures are logged but do not prevent the thread from closing.
+    pub rap_notifier: Option<RapNotifier<H>>,
+}
+
+#[async_trait]
+impl<M: InputSender + 'static, C: ConversationStore + 'static, H: HttpClient + 'static> Tool<M>
+    for CloseThreadTool<C, H>
+{
+    fn name(&self) -> &str {
+        "close_thread"
+    }
+
+    fn description(&self) -> &str {
+        "Permanently shuts down the specified thread, marking it as complete. Use this from a thread that wants to close itself. Make sure to cancel any subscriptions you created before calling this. If the thread has additional information has not already been reported to the parent, include it in report_to_parent. Omit report_to_parent if there is nothing worth reporting."
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "thread_id": {
+                    "type": "string",
+                    "description": "The ID of the thread to close."
+                },
+                "report_to_parent": {
+                    "type": "string",
+                    "description": "Optional report to send to the parent thread."
+                }
+            },
+            "required": ["thread_id"]
+        })
+    }
+
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        id: rap_protocol::ToolCallId,
+        call_id: Option<rap_protocol::ProviderCallId>,
+        context: &ToolContext<M>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let Some(thread_id) = args["thread_id"].as_str() else {
+            return send_tool_error(context, &id, call_id, "thread_id is required").await;
+        };
+        let thread_id = ThreadId::from(thread_id);
+
+        if thread_id != context.group_id {
+            return send_tool_error(
+                context,
+                &id,
+                call_id,
+                format!(
+                    "the provided thread ID to close {} does not match the current thread ID {}",
+                    thread_id, context.group_id
+                ),
+            )
+            .await;
+        }
+
+        // Prevent closing the root thread
+        let Some((parent_id, spawn_tool_call_id)) = self
+            .conversation_store
+            .get_thread_parent_info(&thread_id)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+        else {
+            return send_tool_error(
+                context,
+                &id,
+                call_id,
+                "cannot close the root thread. Only child threads can be closed.",
+            )
+            .await;
+        };
+
+        let report = args.get("report_to_parent").and_then(|v| v.as_str());
+
+        self.conversation_store
+            .close_thread(&thread_id)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        tracing::info!("Closed thread {}", thread_id);
+
+        // Handle compaction threads: store summary and skip normal parent reporting
+        let is_compaction = self
+            .conversation_store
+            .is_compaction_thread(&thread_id)
+            .await
+            .unwrap_or(false);
+
+        if is_compaction {
+            if let Some(report_text) = report {
+                let up_to_order = self
+                    .conversation_store
+                    .get_thread_spawn_order(&thread_id)
+                    .await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+                    .unwrap_or(0);
+                self.conversation_store
+                    .save_compaction_summary(&parent_id, report_text, up_to_order)
+                    .await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                tracing::info!(
+                    "Stored compaction summary for thread {} up to order {}",
+                    parent_id,
+                    up_to_order
+                );
+            }
+
+            // Notify the parent thread to apply the compaction
+            let notify_msg = InputMessage {
+                content: InputMessageContent::User(UserContent::ToolResult(ToolResult {
+                    id: String::new(),
+                    call_id: None,
+                    content: vec![ToolResultContent::Text(Text {
+                        text: "Compaction complete".to_owned(),
+                    })],
+
+                    ..Default::default()
+                })),
+                group_id: parent_id,
+                metadata: None,
+                synthetic: Some(SyntheticKind::Tagged(
+                    TaggedSyntheticKind::CompactionComplete,
+                )),
+                display_as: None,
+                subscription: false,
+            };
+            context
+                .message_sender
+                .send_to_input_queue(notify_msg, id.as_str())
+                .await?;
+            if let Some(ref notifier) = self.rap_notifier {
+                notifier.notify_thread_closed(&thread_id).await;
+            }
+            return Ok(());
+        }
+
+        let is_subscription = self
+            .conversation_store
+            .is_subscription_event_thread(&thread_id)
+            .await
+            .unwrap_or(false);
+
+        let report_text = if is_subscription {
+            report.map(|report_text| format!(
+                    "An event from your subscription {} was processed by a child thread {}. The subscription remains active. Report from the child:\n{}",
+                    spawn_tool_call_id, thread_id, report_text
+                ))
+        } else if let Some(report_text) = report {
+            Some(format!(
+                "Child thread with ID {} has shut down. Report from child thread: {}",
+                thread_id, report_text
+            ))
+        } else {
+            Some(format!("Child thread with ID {} has shut down", thread_id))
+        };
+
+        if let Some(report_text) = report_text {
+            tracing::info!(
+                "Sending report from thread {} to parent {} via tool call {}",
+                thread_id,
+                parent_id,
+                spawn_tool_call_id
+            );
+
+            let report_message = InputMessage {
+                content: InputMessageContent::User(UserContent::ToolResult(ToolResult {
+                    id: String::new(),
+                    call_id: None,
+                    content: vec![ToolResultContent::Text(Text { text: report_text })],
+
+                    ..Default::default()
+                })),
+                group_id: parent_id,
+                metadata: None,
+                synthetic: Some(SyntheticKind::Tagged(TaggedSyntheticKind::ThreadReport {
+                    tool_call_id: spawn_tool_call_id,
+                    child_thread_id: thread_id.clone(),
+                })),
+                display_as: None,
+                subscription: false,
+            };
+
+            context
+                .message_sender
+                .send_to_input_queue(report_message, id.as_str())
+                .await?;
+        }
+
+        // Best-effort: notify RAP tool servers that this thread has been closed
+        // so they can clean up thread-specific resources (e.g. sandboxes).
+        if let Some(ref notifier) = self.rap_notifier {
+            notifier.notify_thread_closed(&thread_id).await;
+        }
+
+        Ok(())
+    }
+}
+
+/// Tool that sends a message to a child thread, injected inline into its history.
+pub struct SendMessageToChildTool<C: ConversationStore> {
+    pub conversation_store: C,
+}
+
+#[async_trait]
+impl<M: InputSender + 'static, C: ConversationStore + 'static> Tool<M>
+    for SendMessageToChildTool<C>
+{
+    fn name(&self) -> &str {
+        "send_message_to_child"
+    }
+
+    fn description(&self) -> &str {
+        "Send a message to a child thread. The message will be injected inline into the child's conversation history."
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "thread_id": {
+                    "type": "string",
+                    "description": "The ID of the child thread to send the message to."
+                },
+                "message": {
+                    "type": "string",
+                    "description": "The message content to send to the child thread."
+                }
+            },
+            "required": ["thread_id", "message"]
+        })
+    }
+
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        id: rap_protocol::ToolCallId,
+        call_id: Option<rap_protocol::ProviderCallId>,
+        context: &ToolContext<M>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let Some(child_thread_id) = args["thread_id"].as_str().map(ThreadId::from) else {
+            return send_tool_error(context, &id, call_id, "thread_id is required").await;
+        };
+        let Some(message_text) = args["message"].as_str() else {
+            return send_tool_error(context, &id, call_id, "message is required").await;
+        };
+
+        let Some((parent_id, spawn_tool_call_id)) = self
+            .conversation_store
+            .get_thread_parent_info(&child_thread_id)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+        else {
+            return send_tool_error(
+                context,
+                &id,
+                call_id,
+                "Child thread not found or has no parent",
+            )
+            .await;
+        };
+
+        if parent_id != context.group_id {
+            return send_tool_error(
+                context,
+                &id,
+                call_id,
+                format!(
+                    "thread {} is not a child of the current thread {}",
+                    child_thread_id, context.group_id
+                ),
+            )
+            .await;
+        }
+
+        tracing::info!(
+            "Sending message from parent {} to child thread {} via tool call {}",
+            context.group_id,
+            child_thread_id,
+            spawn_tool_call_id
+        );
+
+        let child_message = InputMessage {
+            content: InputMessageContent::User(UserContent::ToolResult(ToolResult {
+                id: String::new(),
+                call_id: None,
+                content: vec![ToolResultContent::Text(Text {
+                    text: format!("Message from parent thread: {}", message_text),
+                })],
+
+                ..Default::default()
+            })),
+            group_id: child_thread_id.clone(),
+            metadata: None,
+            synthetic: Some(SyntheticKind::Tagged(TaggedSyntheticKind::ParentMessage {
+                tool_call_id: spawn_tool_call_id,
+            })),
+            display_as: None,
+            subscription: false,
+        };
+
+        context
+            .message_sender
+            .send_to_input_queue(child_message, id.as_str())
+            .await?;
+
+        let tool_result = InputMessage {
+            content: InputMessageContent::User(UserContent::ToolResult(ToolResult {
+                id: id.clone().into_inner(),
+                call_id: call_id.map(|c| c.into_inner()),
+                content: vec![ToolResultContent::Text(Text {
+                    text: "Message sent to child thread.".to_owned(),
+                })],
+
+                ..Default::default()
+            })),
+            group_id: context.group_id.clone(),
+            metadata: None,
+            synthetic: None,
+            display_as: None,
+            subscription: false,
+        };
+
+        context
+            .message_sender
+            .send_to_input_queue(tool_result, id.as_str())
+            .await?;
+
+        Ok(())
+    }
+}

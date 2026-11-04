@@ -1,8 +1,13 @@
+pub mod compaction;
+pub mod history_budget;
 mod infinity;
 mod input_batches;
 mod jobs;
 pub mod model;
 pub mod projection;
+#[cfg(test)]
+mod provider_engine_tests;
+pub mod provider_state;
 pub mod resource;
 mod runtime;
 mod store;

@@ -20,9 +20,74 @@ use language_model_core::{
     LanguageModelToolUse, LanguageModelToolUseInput, MessageContent,
     PreparedLanguageModelCompletion, Role, StopReason, TokenUsage,
 };
+use serde::{Deserialize, Serialize};
 
 const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_TOOL_CALLS: usize = 256;
+const NATIVE_STATE_NAMESPACE: &str = "zed.language-model.v1";
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum NativeProviderState {
+    ToolUse {
+        tool: LanguageModelToolUse,
+    },
+    ReasoningDetails {
+        details: serde_json::Value,
+    },
+    Compaction {
+        context: language_model_core::CompactedContext,
+    },
+    Stop {
+        reason: StopReason,
+    },
+}
+
+fn native_state(state: NativeProviderState) -> Result<StreamChunk> {
+    Ok(StreamChunk::Reasoning(Reasoning {
+        id: None,
+        content: vec![ReasoningContent::ProviderState {
+            namespace: NATIVE_STATE_NAMESPACE.into(),
+            value: serde_json::to_value(state)?,
+        }],
+    }))
+}
+
+pub fn compacted_context_message(
+    context: language_model_core::CompactedContext,
+) -> Result<infinity_agent_core::message::InfinityMessage> {
+    let StreamChunk::Reasoning(reasoning) =
+        native_state(NativeProviderState::Compaction { context })?
+    else {
+        anyhow::bail!("native compaction did not produce a provider-state message");
+    };
+    Ok(infinity_agent_core::message::InfinityMessage::Assistant {
+        content: AssistantContent::Reasoning(reasoning),
+    })
+}
+
+pub(crate) fn compacted_context_from_message(
+    message: &infinity_agent_core::message::InfinityMessage,
+) -> Result<Option<language_model_core::CompactedContext>> {
+    let infinity_agent_core::message::InfinityMessage::Assistant {
+        content: AssistantContent::Reasoning(reasoning),
+    } = message
+    else {
+        return Ok(None);
+    };
+    for content in &reasoning.content {
+        if let ReasoningContent::ProviderState { namespace, value } = content {
+            if namespace == NATIVE_STATE_NAMESPACE {
+                if let NativeProviderState::Compaction { context } =
+                    serde_json::from_value(value.clone())?
+                {
+                    return Ok(Some(context));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
 
 pub struct ModelExecutionRequest {
     pub model_id: String,
@@ -114,6 +179,8 @@ pub struct ZedModelProvider {
     template: LanguageModelRequest,
     executor: ModelExecutionSender,
     observer: Option<ModelEventObserver>,
+    ledger: Option<crate::provider_state::ProviderUsageLedger>,
+    resources: Option<crate::resource::RuntimeResources>,
 }
 
 impl ZedModelProvider {
@@ -127,7 +194,32 @@ impl ZedModelProvider {
             template,
             executor,
             observer: None,
+            ledger: None,
+            resources: None,
         }
+    }
+
+    pub fn with_resources(mut self, resources: crate::resource::RuntimeResources) -> Self {
+        self.resources = Some(resources);
+        self
+    }
+
+    fn completion_error(&self, error: LanguageModelCompletionError) -> CompletionError {
+        if let (Some(resources), Some(delay)) = (&self.resources, error.retry_delay(1)) {
+            if let Err(error) = resources.defer_provider(&self.entry.model_id, delay) {
+                log::error!("cannot record provider backoff: {error:#}");
+            }
+        }
+        map_error(error)
+    }
+
+    pub fn with_state(mut self, store: crate::RuntimeStore, agent_id: String) -> Self {
+        self.ledger = Some(crate::provider_state::ProviderUsageLedger::new(
+            store,
+            agent_id,
+            self.entry.model_id.clone(),
+        ));
+        self
     }
 
     pub fn with_observer(mut self, observer: ModelEventObserver) -> Self {
@@ -138,6 +230,13 @@ impl ZedModelProvider {
 
 #[async_trait]
 impl ModelProvider for ZedModelProvider {
+    fn supports_parallel_tool_calls(&self) -> bool {
+        true
+    }
+    fn preserves_unsigned_reasoning(&self) -> bool {
+        true
+    }
+
     async fn list_models(
         &self,
     ) -> std::result::Result<Vec<ModelEntry>, Box<dyn std::error::Error + Send + Sync>> {
@@ -154,16 +253,94 @@ impl ModelProvider for ZedModelProvider {
                 "the configured model changed; resolve it before another slice",
             ));
         }
+        let permit = if let Some(resources) = &self.resources {
+            resources
+                .wait_for_provider(model_id)
+                .await
+                .map_err(|error| fatal(error.to_string()))?;
+            let bytes = serialized_size(&request)
+                .map_err(|error| fatal(error.to_string()))?
+                .checked_mul(2)
+                .and_then(|bytes| bytes.checked_add(MAX_OUTPUT_BYTES))
+                .ok_or_else(|| fatal("model request byte count overflow"))?;
+            Some(
+                resources
+                    .acquire(crate::resource::ResourceKind::Inference, bytes)
+                    .await
+                    .map_err(|error| fatal(error.to_string()))?,
+            )
+        } else {
+            None
+        };
         let request = convert_request(request, self.template.clone())
             .map_err(|error| fatal(error.to_string()))?;
-        let execution = self
-            .executor
-            .prepare(model_id.to_owned(), request)
-            .await
-            .map_err(map_error)?;
-        let events = execution.execute().await.map_err(map_error)?;
-        Ok(convert_stream(events, self.observer.clone()))
+        let attempt = match &self.ledger {
+            Some(ledger) => Some(
+                ledger
+                    .begin_attempt()
+                    .await
+                    .map_err(|error| fatal(error.to_string()))?,
+            ),
+            None => None,
+        };
+        let execution = self.executor.prepare(model_id.to_owned(), request).await;
+        if let (Err(error), Some(attempt)) = (&execution, &attempt) {
+            attempt
+                .record_provider_error(error)
+                .await
+                .map_err(|failure| {
+                    fatal(format!(
+                        "provider failure checkpoint failed: {failure:#}; {error}"
+                    ))
+                })?;
+        }
+        let execution = execution.map_err(|error| self.completion_error(error))?;
+        let events = execution.execute().await;
+        if let (Err(error), Some(attempt)) = (&events, &attempt) {
+            attempt
+                .record_provider_error(error)
+                .await
+                .map_err(|failure| {
+                    fatal(format!(
+                        "provider failure checkpoint failed: {failure:#}; {error}"
+                    ))
+                })?;
+        }
+        let events = events.map_err(|error| self.completion_error(error))?;
+        let stream = convert_stream_with_ledger(
+            events,
+            self.observer.clone(),
+            attempt,
+            self.resources
+                .clone()
+                .map(|resources| (resources, self.entry.model_id.clone())),
+        );
+        Ok(
+            futures::stream::unfold((stream, permit), |(mut stream, permit)| async move {
+                stream.next().await.map(|chunk| (chunk, (stream, permit)))
+            })
+            .boxed(),
+        )
     }
+}
+
+fn serialized_size(value: &impl Serialize) -> Result<usize> {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_add(bytes.len())
+                .ok_or_else(|| std::io::Error::other("serialized byte count overflow"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, value)?;
+    Ok(counter.0)
 }
 
 fn fatal(message: impl Into<String>) -> CompletionError {
@@ -228,8 +405,36 @@ pub fn convert_request(
             reasoning_details: None,
         });
     }
+    let mut native_tools = HashMap::<String, LanguageModelToolUse>::new();
+    for message in &request.chat_history {
+        if let Message::Assistant { content } = message {
+            for content in content {
+                if let AssistantContent::Reasoning(reasoning) = content {
+                    for block in &reasoning.content {
+                        if let ReasoningContent::ProviderState { namespace, value } = block {
+                            ensure!(
+                                namespace == NATIVE_STATE_NAMESPACE,
+                                "unknown provider-state namespace"
+                            );
+                            if let NativeProviderState::ToolUse { tool } =
+                                serde_json::from_value(value.clone())?
+                            {
+                                native_tools.insert(tool.id.to_string(), tool);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let configured_tools = template
+        .tools
+        .drain(..)
+        .map(|tool| (tool.name.clone(), tool))
+        .collect::<HashMap<_, _>>();
     let mut tools = HashMap::<String, String>::new();
     for message in request.chat_history {
+        let mut reasoning_details = None;
         let (role, content) = match message {
             Message::Assistant { content } => {
                 let mut converted = Vec::new();
@@ -244,14 +449,30 @@ pub fn convert_request(
                                 "secondary provider call IDs require a protocol extension"
                             );
                             tools.insert(call.id.clone(), call.function.name.clone());
-                            converted.push(MessageContent::ToolUse(LanguageModelToolUse {
-                                id: call.id.into(),
-                                name: call.function.name.into(),
-                                raw_input: serde_json::to_string(&call.function.arguments)?,
-                                input: LanguageModelToolUseInput::Json(call.function.arguments),
-                                is_input_complete: true,
-                                thought_signature: None,
-                            }));
+                            let tool = if let Some(tool) = native_tools.remove(&call.id) {
+                                let arguments = match &tool.input {
+                                    LanguageModelToolUseInput::Json(value) => value.clone(),
+                                    LanguageModelToolUseInput::Text(value) => {
+                                        serde_json::Value::String(value.clone())
+                                    }
+                                };
+                                ensure!(
+                                    tool.name.as_ref() == call.function.name
+                                        && arguments == call.function.arguments,
+                                    "native tool state does not match its durable call"
+                                );
+                                tool
+                            } else {
+                                LanguageModelToolUse {
+                                    id: call.id.into(),
+                                    name: call.function.name.into(),
+                                    raw_input: serde_json::to_string(&call.function.arguments)?,
+                                    input: LanguageModelToolUseInput::Json(call.function.arguments),
+                                    is_input_complete: true,
+                                    thought_signature: None,
+                                }
+                            };
+                            converted.push(MessageContent::ToolUse(tool));
                         }
                         AssistantContent::Reasoning(reasoning) => {
                             ensure!(
@@ -266,9 +487,26 @@ pub fn convert_request(
                                     ReasoningContent::Redacted { data } => {
                                         converted.push(MessageContent::RedactedThinking(data))
                                     }
+                                    ReasoningContent::ProviderState { namespace, value } => {
+                                        ensure!(
+                                            namespace == NATIVE_STATE_NAMESPACE,
+                                            "unknown provider-state namespace"
+                                        );
+                                        match serde_json::from_value::<NativeProviderState>(value)?
+                                        {
+                                            NativeProviderState::ToolUse { .. }
+                                            | NativeProviderState::Stop { .. } => {}
+                                            NativeProviderState::ReasoningDetails { details } => {
+                                                reasoning_details = Some(Arc::new(details))
+                                            }
+                                            NativeProviderState::Compaction { context } => {
+                                                converted.push(MessageContent::Compaction(context))
+                                            }
+                                        }
+                                    }
                                     _ => {
                                         return Err(anyhow!(
-                                            "opaque provider reasoning requires a protocol extension"
+                                            "foreign opaque reasoning requires its native provider state"
                                         ));
                                     }
                                 }
@@ -314,9 +552,9 @@ pub fn convert_request(
                             converted.push(MessageContent::ToolResult(LanguageModelToolResult {
                                 tool_use_id: result.id.into(),
                                 tool_name: name.into(),
-                                is_error: false,
+                                is_error: result.is_error,
                                 content,
-                                output: None,
+                                output: result.output,
                             }));
                         }
                     }
@@ -324,20 +562,61 @@ pub fn convert_request(
                 (Role::User, converted)
             }
         };
-        template.messages.push(LanguageModelRequestMessage {
-            role,
-            content,
-            cache: false,
-            reasoning_details: None,
+        let contains_compaction = content
+            .iter()
+            .any(|content| matches!(content, MessageContent::Compaction(_)));
+        let previous = template.messages.last_mut().filter(|previous| {
+            previous.role == role
+                && role == Role::Assistant
+                && !contains_compaction
+                && !previous
+                    .content
+                    .iter()
+                    .any(|content| matches!(content, MessageContent::Compaction(_)))
         });
+        if let Some(previous) = previous {
+            previous.content.extend(content);
+            if reasoning_details.is_some() {
+                previous.reasoning_details = reasoning_details;
+            }
+        } else if !content.is_empty() || reasoning_details.is_some() {
+            template.messages.push(LanguageModelRequestMessage {
+                role,
+                content,
+                cache: false,
+                reasoning_details,
+            });
+        }
     }
     template.tools = request
         .tools
         .into_iter()
         .map(|tool| {
-            LanguageModelRequestTool::function(tool.name, tool.description, tool.parameters, false)
+            configured_tools
+                .get(&tool.name)
+                .cloned()
+                .unwrap_or_else(|| {
+                    LanguageModelRequestTool::function(
+                        tool.name,
+                        tool.description,
+                        tool.parameters,
+                        false,
+                    )
+                })
         })
         .collect();
+    if let Some(index) = template.messages.iter().rposition(|message| {
+        message
+            .content
+            .iter()
+            .any(|content| matches!(content, MessageContent::Compaction(_)))
+    }) {
+        let compacted = template.messages.split_off(index);
+        template
+            .messages
+            .retain(|message| message.role == Role::System);
+        template.messages.extend(compacted);
+    }
     template.max_output_tokens = match (template.max_output_tokens, request.max_tokens) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
@@ -353,6 +632,10 @@ struct StreamState {
     partial_tool_bytes: usize,
     complete_tools: HashMap<String, ToolCall>,
     usage: TokenUsage,
+    reasoning_details: Option<serde_json::Value>,
+    reasoning_detail_bytes: usize,
+    ledger: Option<crate::provider_state::ProviderUsageAttempt>,
+    resources: Option<(crate::resource::RuntimeResources, String)>,
     stopped: bool,
     ended: bool,
     output_bytes: usize,
@@ -374,7 +657,13 @@ impl StreamState {
             observer(&event);
         }
         ensure!(
-            !self.stopped || matches!(event, LanguageModelCompletionEvent::UsageUpdate(_)),
+            !self.stopped
+                || matches!(
+                    event,
+                    LanguageModelCompletionEvent::UsageUpdate(_)
+                        | LanguageModelCompletionEvent::ReasoningDetails(_)
+                        | LanguageModelCompletionEvent::Compaction(_)
+                ),
             "provider emitted content after the response stop"
         );
         if matches!(
@@ -414,10 +703,6 @@ impl StreamState {
             }
             LanguageModelCompletionEvent::ToolUse(tool) => {
                 ensure!(
-                    tool.thought_signature.is_none(),
-                    "tool thought signatures require a protocol extension"
-                );
-                ensure!(
                     tool.raw_input.len() <= MAX_OUTPUT_BYTES,
                     "tool output exceeds the runtime byte limit"
                 );
@@ -441,17 +726,18 @@ impl StreamState {
                         "partial tool identities exceed the runtime byte limit"
                     );
                     ensure!(
-                        self.partial_tools.len() + self.complete_tools.len() <= MAX_TOOL_CALLS,
+                        self.partial_tools.len()
+                            + self.complete_tools.len()
+                            + self.partial_tools.len()
+                            <= MAX_TOOL_CALLS,
                         "too many tool calls in one response"
                     );
                     return Ok(());
                 }
-                let arguments = match tool.input {
-                    LanguageModelToolUseInput::Json(arguments) => arguments,
-                    LanguageModelToolUseInput::Text(_) => {
-                        return Err(anyhow!(
-                            "custom text tool calls require a protocol extension"
-                        ));
+                let arguments = match &tool.input {
+                    LanguageModelToolUseInput::Json(arguments) => arguments.clone(),
+                    LanguageModelToolUseInput::Text(input) => {
+                        serde_json::Value::String(input.clone())
                     }
                 };
                 if self.partial_tools.remove(&id) {
@@ -471,15 +757,24 @@ impl StreamState {
                         .saturating_add(serde_json::to_vec(&call.function.arguments)?.len());
                     self.complete_tools.insert(id, call.clone());
                     ensure!(
-                        self.complete_tools.len() <= MAX_TOOL_CALLS,
+                        self.complete_tools.len() + self.partial_tools.len() <= MAX_TOOL_CALLS,
                         "too many tool calls in one response"
                     );
+                    self.output_bytes = self
+                        .output_bytes
+                        .saturating_add(serde_json::to_vec(&tool)?.len());
+                    self.pending
+                        .push_back(native_state(NativeProviderState::ToolUse { tool })?);
                     self.pending.push_back(StreamChunk::ToolCall(call));
                 }
             }
             LanguageModelCompletionEvent::UsageUpdate(usage) => self.usage = usage,
-            LanguageModelCompletionEvent::Stop(StopReason::EndTurn | StopReason::ToolUse) => {
-                self.stopped = true
+            LanguageModelCompletionEvent::Stop(
+                reason @ (StopReason::EndTurn | StopReason::ToolUse | StopReason::Refusal),
+            ) => {
+                self.stopped = true;
+                self.pending
+                    .push_back(native_state(NativeProviderState::Stop { reason })?);
             }
             LanguageModelCompletionEvent::Stop(reason) => {
                 return Err(anyhow!(
@@ -489,20 +784,34 @@ impl StreamState {
             LanguageModelCompletionEvent::ToolUseJsonParseError {
                 json_parse_error, ..
             } => return Err(anyhow!("invalid tool arguments: {json_parse_error}")),
-            LanguageModelCompletionEvent::ReasoningDetails(_) => {
-                return Err(anyhow!(
-                    "provider reasoning details require a protocol extension"
-                ));
+            LanguageModelCompletionEvent::ReasoningDetails(details) => {
+                let bytes = serde_json::to_vec(&details)?.len();
+                ensure!(
+                    bytes <= MAX_OUTPUT_BYTES,
+                    "provider reasoning details exceed the runtime byte limit"
+                );
+                self.reasoning_detail_bytes = bytes;
+                self.reasoning_details = Some(details);
             }
-            LanguageModelCompletionEvent::Compaction(_) => {
-                return Err(anyhow!("provider compaction requires a protocol extension"));
+            LanguageModelCompletionEvent::Compaction(
+                language_model_core::CompactionUpdate::Finished(context),
+            ) => {
+                self.output_bytes = self
+                    .output_bytes
+                    .saturating_add(serde_json::to_vec(&context)?.len());
+                self.pending
+                    .push_back(native_state(NativeProviderState::Compaction { context })?);
             }
+            LanguageModelCompletionEvent::Compaction(_) => {}
             LanguageModelCompletionEvent::Queued { .. }
             | LanguageModelCompletionEvent::Started
             | LanguageModelCompletionEvent::StartMessage { .. } => {}
         }
         ensure!(
-            self.output_bytes.saturating_add(self.partial_tool_bytes) <= MAX_OUTPUT_BYTES,
+            self.output_bytes
+                .saturating_add(self.partial_tool_bytes)
+                .saturating_add(self.reasoning_detail_bytes)
+                <= MAX_OUTPUT_BYTES,
             "model output exceeds the runtime byte limit"
         );
         Ok(())
@@ -513,6 +822,15 @@ pub fn convert_stream(
     events: LanguageModelCompletionStream,
     observer: Option<ModelEventObserver>,
 ) -> ModelStream {
+    convert_stream_with_ledger(events, observer, None, None)
+}
+
+fn convert_stream_with_ledger(
+    events: LanguageModelCompletionStream,
+    observer: Option<ModelEventObserver>,
+    ledger: Option<crate::provider_state::ProviderUsageAttempt>,
+    resources: Option<(crate::resource::RuntimeResources, String)>,
+) -> ModelStream {
     let state = StreamState {
         events,
         pending: VecDeque::new(),
@@ -521,6 +839,10 @@ pub fn convert_stream(
         partial_tool_bytes: 0,
         complete_tools: HashMap::new(),
         usage: TokenUsage::default(),
+        reasoning_details: None,
+        reasoning_detail_bytes: 0,
+        ledger,
+        resources,
         stopped: false,
         ended: false,
         output_bytes: 0,
@@ -536,6 +858,17 @@ pub fn convert_stream(
             }
             match state.events.next().await {
                 Some(Ok(event)) => {
+                    if let LanguageModelCompletionEvent::UsageUpdate(usage) = &event {
+                        if let Some(ledger) = &state.ledger {
+                            if let Err(error) = ledger.record(*usage, false).await {
+                                state.ended = true;
+                                return Some((
+                                    Err(fatal(format!("usage checkpoint failed: {error:#}"))),
+                                    state,
+                                ));
+                            }
+                        }
+                    }
                     if let Err(error) = state.accept(event) {
                         state.pending.clear();
                         state.ended = true;
@@ -543,6 +876,25 @@ pub fn convert_stream(
                     }
                 }
                 Some(Err(error)) => {
+                    if let Some(attempt) = &state.ledger {
+                        if let Err(failure) = attempt.record_provider_error(&error).await {
+                            state.ended = true;
+                            state.pending.clear();
+                            return Some((
+                                Err(fatal(format!(
+                                    "provider failure checkpoint failed: {failure:#}; {error}"
+                                ))),
+                                state,
+                            ));
+                        }
+                    }
+                    if let (Some((resources, model_id)), Some(delay)) =
+                        (&state.resources, error.retry_delay(1))
+                    {
+                        if let Err(error) = resources.defer_provider(model_id, delay) {
+                            log::error!("cannot record provider backoff: {error:#}");
+                        }
+                    }
                     state.ended = true;
                     state.pending.clear();
                     return Some((Err(map_error(error)), state));
@@ -559,7 +911,22 @@ pub fn convert_stream(
                         ));
                     }
                     state.flush_thinking();
+                    if let Some(details) = state.reasoning_details.take() {
+                        match native_state(NativeProviderState::ReasoningDetails { details }) {
+                            Ok(chunk) => state.pending.push_back(chunk),
+                            Err(error) => return Some((Err(fatal(error.to_string())), state)),
+                        }
+                    }
                     let usage = state.usage;
+                    if let Some(ledger) = &state.ledger {
+                        if let Err(error) = ledger.record(usage, true).await {
+                            state.pending.clear();
+                            return Some((
+                                Err(fatal(format!("usage checkpoint failed: {error:#}"))),
+                                state,
+                            ));
+                        }
+                    }
                     state.pending.push_back(StreamChunk::Final(FinalResponse {
                         usage: Some(Usage {
                             input_tokens: usage
@@ -567,7 +934,11 @@ pub fn convert_stream(
                                 .saturating_add(usage.cache_creation_input_tokens)
                                 .saturating_add(usage.cache_read_input_tokens),
                             output_tokens: usage.output_tokens,
-                            total_tokens: usage.total_tokens(),
+                            total_tokens: usage
+                                .input_tokens
+                                .saturating_add(usage.output_tokens)
+                                .saturating_add(usage.cache_creation_input_tokens)
+                                .saturating_add(usage.cache_read_input_tokens),
                             cached_input_tokens: usage.cache_read_input_tokens,
                         }),
                     }));
@@ -625,6 +996,8 @@ mod tests {
                         id: "call".into(),
                         call_id: None,
                         content: vec![ToolResultContent::text("file contents")],
+
+                        ..Default::default()
                     })],
                 },
             ],
@@ -690,6 +1063,8 @@ mod tests {
                     id: "unknown".into(),
                     call_id: None,
                     content: vec![],
+
+                    ..Default::default()
                 })],
             }],
             ..Default::default()
@@ -793,7 +1168,6 @@ mod tests {
                 json!({"id": "opaque"}),
             )],
             vec![LanguageModelCompletionEvent::Stop(StopReason::MaxTokens)],
-            vec![LanguageModelCompletionEvent::Stop(StopReason::Refusal)],
             vec![
                 LanguageModelCompletionEvent::Stop(StopReason::EndTurn),
                 LanguageModelCompletionEvent::Text("late".into()),
@@ -885,6 +1259,8 @@ mod tests {
             )));
             host_thread
         });
+        let resources =
+            crate::resource::RuntimeResources::new(crate::resource::ResourceLimits::default())?;
         let provider = ZedModelProvider::new(
             ModelEntry {
                 model_id: "fake/model".into(),
@@ -895,7 +1271,8 @@ mod tests {
             },
             LanguageModelRequest::default(),
             executor,
-        );
+        )
+        .with_resources(resources.clone());
         let mut response = provider
             .invoke_model("fake/model", CompletionRequest::default())
             .await?;
@@ -905,7 +1282,11 @@ mod tests {
             std::thread::current().id()
         );
         assert!(response.next().now_or_never().is_none());
+        assert_eq!(resources.snapshot()?.active_inference, 1);
+        assert!(resources.snapshot()?.retained_bytes >= MAX_OUTPUT_BYTES);
         drop(response);
+        assert_eq!(resources.snapshot()?.active_inference, 0);
+        assert_eq!(resources.snapshot()?.retained_bytes, 0);
         assert!(
             events.is_closed(),
             "cancellation must release the actual provider stream"
@@ -928,6 +1309,138 @@ mod tests {
         assert!(second.await.is_err());
         drop(requests);
         assert!(first.await.is_err());
+        Ok(())
+    }
+    #[tokio::test]
+    async fn native_tool_state_and_reasoning_details_round_trip_without_prompt_encoding()
+    -> Result<()> {
+        let mut original = tool(true);
+        original.thought_signature = Some("provider-signature".into());
+        original.input = LanguageModelToolUseInput::Text("*** Begin Patch\n*** End Patch".into());
+        original.raw_input = "*** Begin Patch\n*** End Patch".into();
+        let details = json!([{ "id": "reasoning-id", "encrypted_content": "opaque" }]);
+        let chunks = stream(vec![
+            LanguageModelCompletionEvent::ToolUse(original.clone()),
+            LanguageModelCompletionEvent::ReasoningDetails(details.clone()),
+            LanguageModelCompletionEvent::Stop(StopReason::ToolUse),
+        ])
+        .try_collect::<Vec<_>>()
+        .await?;
+        let content = chunks
+            .into_iter()
+            .filter_map(|chunk| match chunk {
+                StreamChunk::Reasoning(reasoning) => Some(AssistantContent::Reasoning(reasoning)),
+                StreamChunk::ToolCall(call) => Some(AssistantContent::ToolCall(call)),
+                _ => None,
+            })
+            .collect();
+        let request = convert_request(
+            CompletionRequest {
+                chat_history: vec![Message::Assistant { content }],
+                ..Default::default()
+            },
+            LanguageModelRequest::default(),
+        )?;
+        let message = request.messages.first().context("assistant message")?;
+        assert_eq!(message.reasoning_details.as_deref(), Some(&details));
+        let restored = message
+            .content
+            .iter()
+            .find_map(|content| match content {
+                MessageContent::ToolUse(tool) => Some(tool),
+                _ => None,
+            })
+            .context("tool")?;
+        assert_eq!(restored, &original);
+        assert!(!message.string_contents().contains("opaque"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_compaction_replaces_prior_context_and_retains_opaque_state() -> Result<()> {
+        use language_model_core::{CompactedContext, CompactionUpdate};
+        let context = CompactedContext::Summary {
+            content: "summary".into(),
+            provider_state: None,
+        };
+        let chunks = stream(vec![
+            LanguageModelCompletionEvent::Compaction(CompactionUpdate::Finished(context.clone())),
+            LanguageModelCompletionEvent::Text("new answer".into()),
+            LanguageModelCompletionEvent::Stop(StopReason::EndTurn),
+        ])
+        .try_collect::<Vec<_>>()
+        .await?;
+        let mut history = vec![Message::user("old context")];
+        for chunk in chunks {
+            match chunk {
+                StreamChunk::Reasoning(reasoning) => history.push(Message::Assistant {
+                    content: vec![AssistantContent::Reasoning(reasoning)],
+                }),
+                StreamChunk::Text(text) => history.push(Message::assistant(text)),
+                _ => {}
+            }
+        }
+        let request = convert_request(
+            CompletionRequest {
+                preamble: Some("system rules".into()),
+                chat_history: history,
+                ..Default::default()
+            },
+            LanguageModelRequest::default(),
+        )?;
+        assert!(
+            !request
+                .messages
+                .iter()
+                .any(|message| message.string_contents().contains("old context"))
+        );
+        assert!(request.messages.iter().any(|message| {
+            message
+                .content
+                .contains(&MessageContent::Compaction(context.clone()))
+        }));
+        assert!(
+            request
+                .messages
+                .iter()
+                .any(|message| message.string_contents().contains("system rules"))
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn provider_retry_after_delays_other_admitted_completions() -> Result<()> {
+        use crate::resource::{ResourceLimits, RuntimeResources};
+        use std::time::Duration;
+        let resources = RuntimeResources::new(ResourceLimits::default())?;
+        let (executor, _) = model_execution_channel(1)?;
+        let provider = ZedModelProvider::new(
+            ModelEntry {
+                model_id: "fake/model".into(),
+                display_name: "Fake".into(),
+                context_window: 1000,
+                max_output_tokens: None,
+                supports_image_input: false,
+            },
+            LanguageModelRequest::default(),
+            executor,
+        )
+        .with_resources(resources.clone());
+        let error = LanguageModelCompletionError::ProviderRejection {
+            provider: language_model_core::LanguageModelProviderName("Fake".into()),
+            status: None,
+            code: None,
+            message: "rate limited".into(),
+            retry_after: Some(Duration::from_millis(20)),
+            category: language_model_core::ProviderErrorCategory::RateLimit,
+        };
+        assert_eq!(
+            provider.completion_error(error).class(),
+            ErrorClass::Throttled
+        );
+        let ready = resources.wait_for_provider("fake/model");
+        futures::pin_mut!(ready);
+        assert!(ready.as_mut().now_or_never().is_none());
+        ready.await?;
         Ok(())
     }
 }

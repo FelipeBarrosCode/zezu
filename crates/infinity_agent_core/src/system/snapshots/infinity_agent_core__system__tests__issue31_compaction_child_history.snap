@@ -1,0 +1,126 @@
+---
+source: crates/infinity_agent_core/src/system/tests.rs
+assertion_line: 1121
+expression: compaction_req.chat_history
+---
+[
+  {
+    "role": "user",
+    "content": [
+      {
+        "type": "text",
+        "text": "root message one"
+      }
+    ]
+  },
+  {
+    "role": "assistant",
+    "content": [
+      {
+        "text": "root response one"
+      }
+    ]
+  },
+  {
+    "role": "user",
+    "content": [
+      {
+        "type": "text",
+        "text": "root message two"
+      }
+    ]
+  },
+  {
+    "role": "assistant",
+    "content": [
+      {
+        "text": "root response two"
+      }
+    ]
+  },
+  {
+    "role": "user",
+    "content": [
+      {
+        "type": "text",
+        "text": "spawn a child"
+      }
+    ]
+  },
+  {
+    "role": "assistant",
+    "content": [
+      {
+        "id": "[id]",
+        "function": {
+          "name": "spawn_thread",
+          "arguments": {
+            "instructions": "do child work",
+            "child_of": [
+              "root"
+            ]
+          }
+        }
+      }
+    ]
+  },
+  {
+    "role": "user",
+    "content": [
+      {
+        "type": "toolresult",
+        "id": "[id]",
+        "content": [
+          {
+            "type": "text",
+            "text": "[spawn_instructions]"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "role": "assistant",
+    "content": [
+      {
+        "text": "child first response"
+      }
+    ]
+  },
+  {
+    "role": "user",
+    "content": [
+      {
+        "type": "text",
+        "text": "child follow-up"
+      }
+    ]
+  },
+  {
+    "role": "assistant",
+    "content": [
+      {
+        "id": "[id]",
+        "function": {
+          "name": "__harness_begin_compaction__",
+          "arguments": {}
+        }
+      }
+    ]
+  },
+  {
+    "role": "user",
+    "content": [
+      {
+        "type": "toolresult",
+        "id": "[id]",
+        "content": [
+          {
+            "type": "text",
+            "text": "[compaction_instructions]"
+          }
+        ]
+      }
+    ]
+  }
+]

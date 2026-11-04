@@ -1,0 +1,320 @@
+use async_trait::async_trait;
+use infinity_provider_protocol::message::AssistantContent;
+
+use rap_protocol::{ChoiceId, ThreadId, ToolCallId};
+
+use crate::message::{InfinityMessage, InputMessage};
+use crate::system::UserChoice;
+
+/// How much of the parent's conversation history a newly spawned child
+/// thread inherits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpawnContext {
+    /// Inherit the parent's history up to the given message order
+    /// (exclusive). Callers pass the safe spawn point — the cutoff right
+    /// before the spawn tool call itself and any trailing unanswered tool
+    /// calls — and seed the child's own store with whatever the child needs
+    /// past the cutoff (e.g. a copy of the spawn call).
+    InheritUpTo(usize),
+    /// Start with an empty history: the child sees none of the parent's (or
+    /// any ancestor's) messages. Instructions sent to the child must be
+    /// fully self-contained.
+    Fresh,
+}
+
+/// Persistent conversation history storage (DSQL in Lambda, in-memory for CLI).
+#[async_trait]
+pub trait ConversationStore: Send + Sync + Clone {
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    async fn ensure_root_thread(&self, thread_id: &ThreadId<str>) -> Result<(), Self::Error>;
+
+    /// Return whether an exact root or child thread record exists without
+    /// creating it.
+    async fn thread_exists(&self, thread_id: &ThreadId<str>) -> Result<bool, Self::Error>;
+
+    /// Load history for a session. Both bounds are counted in messages from
+    /// the start of the thread: `start_from` skips that many leading
+    /// messages, `up_to` truncates to that many leading messages (so
+    /// `start_from: Some(a), up_to: Some(b)` yields the a-th through b-1-th
+    /// messages, zero-based). `None` means unbounded.
+    ///
+    /// Implementations may number rows internally however they like (the
+    /// in-memory store uses zero-based indexes with an inclusive-start/
+    /// exclusive-end slice; the DSQL store uses one-based orders with an
+    /// exclusive-start/inclusive-end predicate) as long as the parameters
+    /// are interpreted as leading-row counts. All persisted "order" values
+    /// (spawn cutoffs, compaction `up_to_order`s) follow this same
+    /// count-based convention.
+    async fn load_history_up_to(
+        &self,
+        session_id: &ThreadId<str>,
+        start_from: Option<i64>,
+        up_to: Option<i64>,
+    ) -> Result<Vec<InfinityMessage>, Self::Error>;
+
+    /// Load full history for a thread including ancestor context and compaction.
+    /// Walks backwards through ancestors to find the most recent compaction
+    /// summary, skipping all earlier ancestors (their content is in the summary).
+    /// Returns `(history, leaf_compacted_up_to, ancestor_prefix_len)` where the
+    /// second element is the absolute store index the leaf thread's compaction
+    /// covers (if any), and the third is how many messages at the front of the
+    /// history come from ancestors (not this thread's own store).
+    async fn load_history_with_ancestors(
+        &self,
+        thread_id: &ThreadId<str>,
+    ) -> Result<(Vec<InfinityMessage>, Option<i64>, usize), Self::Error> {
+        // Check the thread itself first
+        if let Ok(Some((summary, compacted_up_to))) = self
+            .load_latest_compaction_summary_up_to(thread_id, None)
+            .await
+        {
+            let mut combined = vec![InfinityMessage::Assistant {
+                content: AssistantContent::text(format!(
+                    "[Compacted conversation summary]\n{}",
+                    summary
+                )),
+            }];
+            combined.extend(
+                self.load_history_up_to(thread_id, Some(compacted_up_to), None)
+                    .await?,
+            );
+            return Ok((combined, Some(compacted_up_to), 0));
+        }
+
+        let mut ancestors = self.get_ancestor_chain(thread_id).await?;
+
+        // Fresh-context threads sever history inheritance: nothing from
+        // before the fresh spawn is visible. Find the deepest fresh boundary
+        // in the chain (the leaf itself, or an ancestor) and drop every
+        // ancestor slice above it. Entry `i` holds ancestor `i`'s own slice,
+        // so when ancestor `i` is the fresh thread its slice is kept.
+        if self.is_fresh_context_thread(thread_id).await? {
+            ancestors.clear();
+        } else {
+            for i in (0..ancestors.len()).rev() {
+                if self.is_fresh_context_thread(&ancestors[i].0).await? {
+                    ancestors.drain(..i);
+                    break;
+                }
+            }
+        }
+
+        // Walk backwards to find the first ancestor with a compaction summary
+        let mut compaction_idx = None;
+        let mut compaction_summary = None;
+        for i in (0..ancestors.len()).rev() {
+            let (ref tid, cutoff) = ancestors[i];
+            if let Ok(Some((summary, compacted_up_to))) = self
+                .load_latest_compaction_summary_up_to(tid, Some(cutoff))
+                .await
+            {
+                compaction_idx = Some(i);
+                compaction_summary = Some((summary, compacted_up_to));
+                break;
+            }
+        }
+
+        let mut combined = Vec::new();
+
+        if let (Some(idx), Some((summary, compacted_up_to))) = (compaction_idx, compaction_summary)
+        {
+            // Prepend the compaction summary (covers all ancestors before idx + ancestor idx's messages up to compacted_up_to)
+            combined.push(InfinityMessage::Assistant {
+                content: AssistantContent::text(format!(
+                    "[Compacted conversation summary]\n{}",
+                    summary
+                )),
+            });
+            // Load remaining messages from the compacted ancestor (after summary, up to cutoff)
+            let (_, cutoff) = &ancestors[idx];
+            combined.extend(
+                self.load_history_up_to(&ancestors[idx].0, Some(compacted_up_to), Some(*cutoff))
+                    .await?,
+            );
+            // Load subsequent ancestors normally
+            for (tid, cutoff) in &ancestors[idx + 1..] {
+                combined.extend(self.load_history_up_to(tid, None, Some(*cutoff)).await?);
+            }
+        } else {
+            // No compaction anywhere — load all ancestors
+            for (tid, cutoff) in &ancestors {
+                combined.extend(self.load_history_up_to(tid, None, Some(*cutoff)).await?);
+            }
+        }
+
+        let ancestor_prefix_len = combined.len();
+        combined.extend(self.load_history_up_to(thread_id, None, None).await?);
+        Ok((combined, None, ancestor_prefix_len))
+    }
+
+    async fn append_messages(
+        &self,
+        session_id: &ThreadId<str>,
+        messages: Vec<(InfinityMessage, String)>,
+    ) -> Result<(), Self::Error>;
+
+    async fn spawn_thread(
+        &self,
+        parent_thread_id: &ThreadId<str>,
+        spawn_tool_call_id: &ToolCallId<str>,
+        is_for_subscription_event: bool,
+        context: SpawnContext,
+    ) -> Result<ThreadId, Self::Error>;
+
+    async fn is_thread_closed(&self, thread_id: &ThreadId<str>) -> Result<bool, Self::Error>;
+
+    async fn close_thread(&self, thread_id: &ThreadId<str>) -> Result<(), Self::Error>;
+
+    async fn is_subscription_event_thread(
+        &self,
+        thread_id: &ThreadId<str>,
+    ) -> Result<bool, Self::Error>;
+
+    /// Whether `thread_id` was spawned with [`SpawnContext::Fresh`] (no
+    /// inherited history). Fresh threads act as a boundary in
+    /// [`load_history_with_ancestors`](Self::load_history_with_ancestors):
+    /// neither they nor their descendants see any context from before the
+    /// fresh spawn.
+    async fn is_fresh_context_thread(&self, thread_id: &ThreadId<str>)
+    -> Result<bool, Self::Error>;
+
+    async fn get_thread_parent_info(
+        &self,
+        thread_id: &ThreadId<str>,
+    ) -> Result<Option<(ThreadId, ToolCallId)>, Self::Error>;
+
+    async fn get_ancestor_chain(
+        &self,
+        thread_id: &ThreadId<str>,
+    ) -> Result<Vec<(ThreadId, i64)>, Self::Error>;
+
+    // ── Compaction support ──
+
+    async fn mark_thread_as_compaction(&self, thread_id: &ThreadId<str>)
+    -> Result<(), Self::Error>;
+
+    async fn is_compaction_thread(&self, thread_id: &ThreadId<str>) -> Result<bool, Self::Error>;
+
+    async fn get_thread_spawn_order(
+        &self,
+        thread_id: &ThreadId<str>,
+    ) -> Result<Option<i64>, Self::Error>;
+
+    async fn save_compaction_summary(
+        &self,
+        thread_id: &ThreadId<str>,
+        summary: &str,
+        up_to_order: i64,
+    ) -> Result<(), Self::Error>;
+
+    /// Load the latest compaction summary. When `up_to_order` is `Some(n)`,
+    /// only return summaries whose `up_to_order` is <= n.
+    async fn load_latest_compaction_summary_up_to(
+        &self,
+        thread_id: &ThreadId<str>,
+        up_to_order: Option<i64>,
+    ) -> Result<Option<(String, i64)>, Self::Error>;
+}
+
+/// Key-value state store for processed message IDs, metadata, toolset caches
+/// (DynamoDB in Lambda, in-memory HashMap for CLI).
+#[async_trait]
+pub trait StateStore: Send + Sync + Clone {
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Durably deduplicated message IDs for this thread. Only inputs that are
+    /// not naturally idempotent are tracked (user text and subscription
+    /// events); tool results are deduplicated against history itself.
+    async fn get_processed_ids(
+        &self,
+        thread_id: &ThreadId<str>,
+    ) -> Result<std::collections::HashSet<String>, Self::Error>;
+
+    async fn add_processed_message_ids(
+        &self,
+        thread_id: &ThreadId<str>,
+        message_ids: Vec<String>,
+    ) -> Result<(), Self::Error>;
+
+    async fn get_metadata(
+        &self,
+        root_thread_id: &ThreadId<str>,
+    ) -> Result<Option<serde_json::Value>, Self::Error>;
+
+    async fn set_metadata(
+        &self,
+        root_thread_id: &ThreadId<str>,
+        metadata: serde_json::Value,
+    ) -> Result<(), Self::Error>;
+
+    /// Return the list of active subscription tool_call_ids for a specific thread.
+    async fn get_active_subscriptions(
+        &self,
+        thread_id: &ThreadId<str>,
+    ) -> Result<Vec<ToolCallId>, Self::Error>;
+
+    /// Record a new active subscription (tool_call_id) for a specific thread.
+    async fn add_active_subscription(
+        &self,
+        thread_id: &ThreadId<str>,
+        tool_call_id: &ToolCallId<str>,
+    ) -> Result<(), Self::Error>;
+
+    /// Remove an active subscription (tool_call_id) from a specific thread.
+    async fn remove_active_subscription(
+        &self,
+        thread_id: &ThreadId<str>,
+        tool_call_id: &ToolCallId<str>,
+    ) -> Result<(), Self::Error>;
+
+    /// Add or replace a pending user choice for one thread.
+    async fn add_pending_user_choice(
+        &self,
+        thread_id: &ThreadId<str>,
+        choice: UserChoice,
+    ) -> Result<(), Self::Error>;
+
+    /// Remove a pending user choice after it is answered or interrupted.
+    async fn remove_pending_user_choice(
+        &self,
+        thread_id: &ThreadId<str>,
+        choice_id: &ChoiceId<str>,
+    ) -> Result<(), Self::Error>;
+
+    /// List choices awaiting a response for one thread.
+    async fn get_pending_user_choices(
+        &self,
+        thread_id: &ThreadId<str>,
+    ) -> Result<Vec<UserChoice>, Self::Error>;
+
+    /// Whether an existing thread has been explicitly stopped.
+    ///
+    /// The local router consults this before spawning a driver for input that
+    /// cannot legitimately resume a stopped thread: synthetic subscription
+    /// events and thread reports, tool results, OAuth completions, and user
+    /// choices. Returning `true` drops such input before a driver is spawned.
+    /// Plain user text is never gated by this method because sending new text
+    /// is how a user resumes a stopped thread.
+    ///
+    /// `thread_id` is the target thread itself, not necessarily its root.
+    /// Implementations that track stopped state per conversation may resolve
+    /// the root themselves. Stores without stopped-thread policy inherit the
+    /// default `false` response.
+    async fn is_thread_stopped(&self, _thread_id: &ThreadId<str>) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
+}
+
+/// Abstraction over input message delivery (SQS in Lambda, channel/direct in CLI).
+#[async_trait]
+pub trait InputSender: Send + Sync + Clone {
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Send a message to the input queue for processing.
+    async fn send_to_input_queue(
+        &self,
+        message: InputMessage,
+        dedup_id: &str,
+    ) -> Result<(), Self::Error>;
+}
