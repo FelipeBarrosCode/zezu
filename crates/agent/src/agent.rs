@@ -12,9 +12,11 @@ pub use runtime_tools::{
 pub mod outline;
 mod pattern_extraction;
 pub mod runtime_compaction;
+mod runtime_connection;
 pub mod runtime_context;
 pub mod runtime_orchestration;
 pub mod runtime_project;
+pub mod runtime_session_controls;
 pub mod runtime_workspaces;
 mod sandboxing;
 mod templates;
@@ -32,6 +34,7 @@ pub use native_agent_server::NativeAgentServer;
 pub use native_runtime::{NativeRuntime, NativeRuntimeConfig, RuntimeContextLoader};
 use parking_lot::Mutex;
 pub use pattern_extraction::*;
+pub use runtime_connection::NativeRuntimeConnection;
 pub use sandboxing::{
     ThreadSandbox, sandbox_worktree_writable_paths, settings_sandbox_policy,
     settings_thread_sandbox,
