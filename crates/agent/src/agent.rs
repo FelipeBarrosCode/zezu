@@ -11,6 +11,7 @@ pub use runtime_tools::{
 pub mod outline;
 mod pattern_extraction;
 pub mod runtime_context;
+pub mod runtime_project;
 mod sandboxing;
 mod templates;
 #[cfg(test)]
