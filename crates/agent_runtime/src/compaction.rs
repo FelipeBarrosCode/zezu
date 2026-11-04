@@ -329,6 +329,7 @@ impl RuntimeStore {
             let transaction = connection.transaction()?;
             let changed = transaction.execute("UPDATE agents SET state='paused',pause_requested=1,generation=generation+1,lease_id=NULL WHERE id=? AND state NOT IN ('cancelled','completed','failed')", [&agent])?;
             ensure!(changed == 1, "no active conversation to compact");
+            crate::orchestration::Orchestrator::rebind_task(&transaction,&agent)?;
             transaction.execute("UPDATE inbox SET lease_id=NULL WHERE agent_id=? AND processed=0", [&agent])?;
             transaction.execute("UPDATE jobs SET state='uncertain' WHERE agent_id=? AND state='dispatched'", [&agent])?;
             let generation: i64 = transaction.query_row("SELECT generation FROM agents WHERE id=?", [&agent], |row| row.get(0))?;

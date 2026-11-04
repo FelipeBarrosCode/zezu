@@ -247,7 +247,7 @@ async fn drive_inner(
             changed=stop.changed()=> { if changed.is_err() || *stop.borrow() { break; } }
             Some((lease,outcome))=tasks.next(),if !tasks.is_empty()=> {
                 active.remove(&lease.agent_id);
-                let error=match outcome { Ok(Ok(()))=>None,Ok(Err(error))=>Some(error.to_string()),Err(_)=>None };
+                let error=match outcome { Ok(Ok(()))=>{ crate::orchestration::Orchestrator::open(store.clone()).await?.complete_idle_child(lease.agent_id.clone(),lease.generation).await?; None },Ok(Err(error))=>Some(error.to_string()),Err(_)=>None };
                 if let Some(error)=&error {
                     log::error!("agent {} stopped at checkpoint: {error}",lease.agent_id);
                     let current=store.snapshot(lease.agent_id.clone()).await?;

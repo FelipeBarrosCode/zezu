@@ -183,7 +183,7 @@ impl RuntimeStore {
 
     pub async fn pending_job_count(&self, agent_id: String) -> Result<usize> {
         self.read(move |connection| Ok(connection.query_row(
-            "SELECT (SELECT count(*) FROM jobs WHERE agent_id=?1 AND state IN ('queued','dispatched','uncertain'))",[agent_id],|row| row.get(0),
+            "SELECT (SELECT count(*) FROM jobs WHERE agent_id=?1 AND state IN ('queued','dispatched','uncertain')) + (SELECT count(*) FROM runtime_joins j JOIN agents a ON a.id=j.agent_id WHERE j.agent_id=?1 AND j.generation=a.generation AND j.state='pending')",[agent_id],|row| row.get(0),
         )?)).await
     }
 

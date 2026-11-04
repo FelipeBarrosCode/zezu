@@ -141,3 +141,67 @@ async fn compaction_retains_signed_pending_tool_tail_and_does_not_replay_complet
     store.interrupt(next).await?;
     store.shutdown().await
 }
+
+#[tokio::test]
+async fn manual_compaction_preserves_pending_join_barriers_and_child_reports() -> Result<()> {
+    use crate::orchestration::{FailurePolicy, Orchestrator, TaskIdentity, TaskResult};
+    let directory = tempfile::tempdir()?;
+    let store = RuntimeStore::open(
+        directory.path().join("runtime.sqlite"),
+        RuntimeLimits::default(),
+    )?;
+    store
+        .create_root("root".into(), serde_json::json!({}))
+        .await?;
+    let orchestrator = Orchestrator::open(store.clone()).await?;
+    let child = orchestrator
+        .spawn_child(
+            TaskIdentity {
+                agent_id: "root".into(),
+                generation: 0,
+            },
+            "child".into(),
+            0,
+            true,
+        )
+        .await?;
+    orchestrator
+        .wait_for(
+            TaskIdentity {
+                agent_id: "root".into(),
+                generation: 0,
+            },
+            "join".into(),
+            vec![child.clone()],
+            FailurePolicy::Collect,
+        )
+        .await?;
+    let generation = store.begin_compaction("root".into()).await?;
+    let recorded = store
+        .read(|connection| {
+            Ok(connection.query_row(
+                "SELECT generation FROM runtime_joins WHERE agent_id='root' AND state='pending'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?)
+        })
+        .await?;
+    assert_eq!(recorded, generation);
+    store.resume("root".into()).await?;
+    assert!(store.admit().await?.is_none());
+    orchestrator
+        .report(
+            TaskIdentity {
+                agent_id: child,
+                generation: 0,
+            },
+            "result".into(),
+            TaskResult::Success(serde_json::json!({"done":true})),
+        )
+        .await?;
+    let lease = store.admit().await?.context("joined parent must wake")?;
+    assert_eq!(lease.agent_id, "root");
+    assert_eq!(lease.generation, generation);
+    store.interrupt(lease).await?;
+    store.shutdown().await
+}
