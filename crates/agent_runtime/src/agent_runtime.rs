@@ -2,9 +2,11 @@ pub mod compaction;
 pub mod history_budget;
 mod infinity;
 mod input_batches;
+pub mod integration;
 mod jobs;
 pub mod model;
 pub mod orchestration;
+pub mod orchestration_tools;
 pub mod projection;
 #[cfg(test)]
 mod provider_engine_tests;
