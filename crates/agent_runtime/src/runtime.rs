@@ -32,6 +32,7 @@ pub type RuntimeNoticeReceiver = broadcast::Receiver<RuntimeNotice>;
 
 struct Owner {
     stop: watch::Sender<bool>,
+    controls: async_channel::Sender<BoxFuture<'static, ()>>,
     worker: Mutex<WorkerState>,
 }
 
@@ -59,6 +60,7 @@ impl ThreadObserver for QuietObserver {
 impl EmbeddedRuntime {
     pub fn start(store: RuntimeStore, factory: SliceFactory) -> Result<Self> {
         let (stop, receiver) = watch::channel(false);
+        let (controls, control_receiver) = async_channel::bounded(16);
         let (notices, _) = broadcast::channel(256);
         let worker_notices = notices.clone();
         let worker_store = store.clone();
@@ -88,6 +90,7 @@ impl EmbeddedRuntime {
                     factory,
                     receiver,
                     worker_notices,
+                    control_receiver,
                 )))
             })?;
         started
@@ -98,6 +101,7 @@ impl EmbeddedRuntime {
             store,
             owner: Arc::new(Owner {
                 stop,
+                controls,
                 worker: Mutex::new(WorkerState {
                     thread: Some(worker),
                     shutdown: None,
@@ -113,6 +117,37 @@ impl EmbeddedRuntime {
 
     pub fn request_shutdown(&self) {
         self.owner.stop.send_replace(true);
+    }
+
+    pub async fn execute_control<T: Send + 'static>(
+        &self,
+        operation: BoxFuture<'static, Result<T>>,
+    ) -> Result<T> {
+        struct Cancel(futures::future::AbortHandle);
+        impl Drop for Cancel {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let (abort, registration) = AbortHandle::new_pair();
+        let _cancel = Cancel(abort);
+        let (response, receiver) = futures::channel::oneshot::channel();
+        let control = async move {
+            let result = Abortable::new(operation, registration)
+                .await
+                .map_err(|_| anyhow!("runtime control was cancelled"))
+                .and_then(|result| result);
+            if let Err(Err(error)) = response.send(result) {
+                log::debug!("detached runtime control: {error:#}");
+            }
+        }
+        .boxed();
+        self.owner
+            .controls
+            .send(control)
+            .await
+            .map_err(|_| anyhow!("runtime control host stopped"))?;
+        receiver.await.context("runtime control host stopped")?
     }
 
     pub async fn shutdown(&self) -> Result<()> {
@@ -163,8 +198,9 @@ async fn drive(
     factory: SliceFactory,
     stop: watch::Receiver<bool>,
     notices: broadcast::Sender<RuntimeNotice>,
+    controls: async_channel::Receiver<BoxFuture<'static, ()>>,
 ) -> Result<()> {
-    let outcome = drive_inner(store.clone(), factory, stop, notices).await;
+    let outcome = drive_inner(store.clone(), factory, stop, notices, controls).await;
     let shutdown = store.shutdown().await;
     outcome.and(shutdown)
 }
@@ -174,9 +210,11 @@ async fn drive_inner(
     factory: SliceFactory,
     mut stop: watch::Receiver<bool>,
     notices: broadcast::Sender<RuntimeNotice>,
+    controls: async_channel::Receiver<BoxFuture<'static, ()>>,
 ) -> Result<()> {
     let mut active = HashMap::<String, (Lease, AbortHandle)>::new();
     let mut tasks = FuturesUnordered::<SliceTask>::new();
+    let mut control_tasks = FuturesUnordered::<BoxFuture<'static, ()>>::new();
     let mut tick = tokio::time::interval(Duration::from_millis(25));
     loop {
         if *stop.borrow() {
@@ -204,6 +242,8 @@ async fn drive_inner(
             );
         }
         tokio::select! {
+            control=controls.recv(),if control_tasks.len()<4=> { if let Ok(control)=control {control_tasks.push(control);} }
+            Some(())=control_tasks.next(),if !control_tasks.is_empty()=>{}
             changed=stop.changed()=> { if changed.is_err() || *stop.borrow() { break; } }
             Some((lease,outcome))=tasks.next(),if !tasks.is_empty()=> {
                 active.remove(&lease.agent_id);
@@ -211,7 +251,10 @@ async fn drive_inner(
                 if let Some(error)=&error {
                     log::error!("agent {} stopped at checkpoint: {error}",lease.agent_id);
                     let current=store.snapshot(lease.agent_id.clone()).await?;
-                    if current.state=="running" && current.generation==lease.generation { store.interrupt(lease.clone()).await?; }
+                    if current.state=="running" && current.generation==lease.generation {
+                        store.record_error(lease.clone(), error.clone()).await?;
+                        store.interrupt(lease.clone()).await?;
+                    }
                 }
                 if notices.receiver_count()>0 && notices.send(RuntimeNotice {agent_id:lease.agent_id,error}).is_err() {
                     log::debug!("runtime notice subscriber detached");
@@ -229,5 +272,10 @@ async fn drive_inner(
         abort.abort();
     }
     drop(tasks);
+    controls.close();
+    while let Ok(control) = controls.try_recv() {
+        drop(control);
+    }
+    drop(control_tasks);
     Ok(())
 }

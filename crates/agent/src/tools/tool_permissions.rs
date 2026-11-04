@@ -631,6 +631,20 @@ pub fn authorize_file_edit(
     event_stream: &ToolCallEventStream,
     cx: &mut App,
 ) -> Task<Result<()>> {
+    let project = match thread.read_with(cx, |thread, _| thread.project().clone()) {
+        Ok(project) => project,
+        Err(error) => return Task::ready(Err(error)),
+    };
+    authorize_project_file_edit(tool_name, path, project, event_stream, cx)
+}
+
+pub(crate) fn authorize_project_file_edit(
+    tool_name: &str,
+    path: &Path,
+    project_entity: Entity<Project>,
+    event_stream: &ToolCallEventStream,
+    cx: &mut App,
+) -> Task<Result<()>> {
     let path_str = path.to_string_lossy();
 
     let settings = agent_settings::AgentSettings::get_global(cx);
@@ -643,7 +657,7 @@ pub fn authorize_file_edit(
     let path_owned = path.to_path_buf();
     let title = format!("Edit {}", util::markdown::MarkdownInlineCode(&path_str));
     let tool_name = tool_name.to_string();
-    let thread = thread.clone();
+    let fs = project_entity.read(cx).fs().clone();
     let event_stream = event_stream.clone();
 
     // The raw-path sensitivity checks are synchronous (pure path inspection).
@@ -659,12 +673,6 @@ pub fn authorize_file_edit(
 
     cx.spawn(async move |cx| {
         // Resolve the path and check for symlink escapes.
-        let (project_entity, fs) = thread.read_with(cx, |thread, cx| {
-            let project = thread.project().clone();
-            let fs = project.read(cx).fs().clone();
-            (project, fs)
-        })?;
-
         let canonical_roots = canonicalize_worktree_roots(&project_entity, &fs, cx).await;
 
         let resolved = project_entity.read_with(cx, |project, cx| {

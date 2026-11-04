@@ -2,6 +2,12 @@ mod db;
 mod legacy_thread;
 mod native_agent_server;
 mod native_runtime;
+pub mod runtime_terminal;
+mod runtime_tools;
+pub use runtime_tools::{
+    RuntimeInternalExecutor, RuntimeToolContext, RuntimeToolEventSink, RuntimeToolHost,
+    RuntimeToolPreparation, RuntimeToolResolver,
+};
 pub mod outline;
 mod pattern_extraction;
 mod sandboxing;
