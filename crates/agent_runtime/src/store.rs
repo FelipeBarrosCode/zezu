@@ -139,11 +139,13 @@ impl RuntimeStore {
         );
         crate::jobs::initialize_connection(&connection)?;
         crate::compaction::initialize(&connection)?;
+        crate::workspaces::WorkspacePool::initialize_connection(&connection)?;
         crate::input_batches::initialize(&connection)?;
         crate::orchestration::Orchestrator::initialize_connection(&connection)?;
         crate::projection::initialize(&connection)?;
         recover(&mut connection)?;
         crate::orchestration::Orchestrator::recover_connection(&connection)?;
+        Self::recover_workspace_waits(&connection)?;
         let mut readers = Vec::new();
         for _ in 0..2 {
             let reader =
@@ -434,7 +436,7 @@ impl RuntimeStore {
             transaction.commit()?;
             Ok(())
         }).await?;
-        Ok(())
+        self.notify_workspace_available().await
     }
 
     pub async fn cancel(&self, agent_id: String) -> Result<()> {

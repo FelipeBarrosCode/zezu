@@ -13,6 +13,7 @@ pub mod outline;
 mod pattern_extraction;
 pub mod runtime_context;
 pub mod runtime_project;
+pub mod runtime_workspaces;
 mod sandboxing;
 mod templates;
 #[cfg(test)]

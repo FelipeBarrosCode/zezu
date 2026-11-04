@@ -124,6 +124,7 @@ pub struct RuntimeToolHost {
     quitting: bool,
     resources: Option<RuntimeResources>,
     preparation: Option<RuntimeToolPreparation>,
+    workspace_epoch: Option<u64>,
     _driver: Task<()>,
     _quit: Subscription,
 }
@@ -135,6 +136,7 @@ impl RuntimeToolHost {
 
     pub fn set_resources(&mut self, resources: RuntimeResources) {
         self.resources = Some(resources);
+        self.workspace_epoch = None;
     }
 
     pub fn start(
@@ -178,6 +180,18 @@ impl RuntimeToolHost {
                 };
                 if quitting {
                     break;
+                }
+                let wake=this.update(cx,|host,_| {
+                    let epoch=host.resources.as_ref().map(RuntimeResources::workspace_epoch).transpose()?;
+                    let changed=epoch.is_some() && epoch!=host.workspace_epoch;
+                    host.workspace_epoch=epoch;
+                    Ok::<_,anyhow::Error>(changed)
+                });
+                match wake {
+                    Ok(Ok(true))=>if let Err(error)=store.notify_workspace_available().await {log::error!("could not wake workspace jobs: {error:#}");},
+                    Ok(Ok(false))=>{},
+                    Ok(Err(error))=> {log::error!("workspace resource state failed: {error:#}");break;},
+                    Err(_)=>break,
                 }
                 let active_agents=active.iter().map(|(_,agent_id)|agent_id.clone()).collect();
                 let enabled=cx.update(|cx|agent_settings::AgentSettings::get_global(cx).enabled(cx));
@@ -273,6 +287,7 @@ impl RuntimeToolHost {
             quitting: false,
             resources: None,
             preparation: None,
+            workspace_epoch: None,
             _driver: driver,
             _quit: quit,
         }

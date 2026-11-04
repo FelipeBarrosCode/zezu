@@ -14,6 +14,7 @@ mod runtime;
 mod store;
 #[cfg(test)]
 mod tests;
+pub mod workspaces;
 
 pub use infinity::{InfinitySlice, SqliteInfinityStore};
 pub use projection::{FleetSummary, HistoryReference, TranscriptEntry, TranscriptPage};

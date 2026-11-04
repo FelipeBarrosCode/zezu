@@ -182,10 +182,25 @@ impl Orchestrator {
     }
 
     pub async fn complete_idle_child(&self, agent_id: String, generation: i64) -> Result<bool> {
+        let dirty = self
+            .store
+            .workspace_has_uncheckpointed_edits(TaskIdentity {
+                agent_id: agent_id.clone(),
+                generation,
+            })
+            .await?;
         self.store.write(move |connection| {
             let transaction=connection.transaction()?;
             let ready:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM agents a WHERE a.id=? AND a.generation=? AND a.parent_id IS NOT NULL AND a.state='waiting' AND a.pause_requested=0 AND json_extract(a.checkpoint,'$.completed_step')=1 AND NOT EXISTS(SELECT 1 FROM inbox WHERE agent_id=a.id AND processed=0) AND NOT EXISTS(SELECT 1 FROM jobs WHERE agent_id=a.id AND state IN ('queued','dispatched','uncertain')) AND NOT EXISTS(SELECT 1 FROM runtime_joins WHERE agent_id=a.id AND generation=a.generation AND state='pending') AND NOT EXISTS(SELECT 1 FROM subscriptions WHERE agent_id=a.id) AND NOT EXISTS(SELECT 1 FROM choices WHERE agent_id=a.id))",params![agent_id,generation],|row|row.get(0))?;
             if !ready { return Ok(false); }
+            if dirty {
+                let input=InputMessage::user_text(agent_id.clone(),"Your task cannot finish with uncheckpointed workspace edits. Use runtime_workspace_checkpoint, inspect its checks/integration result, then release the clean workspace before reporting completion.");
+                let inserted=transaction.execute("INSERT OR IGNORE INTO inbox(agent_id,message_id,payload) VALUES (?,?,?)",params![agent_id,format!("finish-checkpoint:{generation}"),serde_json::to_string(&input)?])?;
+                if inserted==1 {transaction.execute("UPDATE agents SET state='queued' WHERE id=?",[&agent_id])?;}
+                else {transaction.execute("UPDATE agents SET state='paused',pause_requested=1,checkpoint=? WHERE id=?",params![serde_json::json!({"error":"task ended with uncheckpointed editing state"}).to_string(),agent_id])?;}
+                transaction.commit()?;
+                return Ok(false);
+            }
             let summary:Option<String>=transaction.query_row("SELECT substr(json_extract(payload,'$.content.text'),1,32768) FROM history WHERE agent_id=? AND json_extract(payload,'$.kind')='assistant' AND json_extract(payload,'$.content.text') IS NOT NULL ORDER BY position DESC LIMIT 1",[&agent_id],|row|row.get(0)).optional()?.flatten();
             let result=TaskResult::Success(summary.map(Value::String).unwrap_or(Value::Null));
             let inserted=transaction.execute("INSERT OR IGNORE INTO runtime_task_reports(agent_id,generation,report_key,parent_id,result) SELECT id,generation,?,parent_id,? FROM agents WHERE id=?",params![format!("idle:{generation}"),serde_json::to_string(&result)?,agent_id])?;
@@ -216,6 +231,13 @@ impl Orchestrator {
         ensure!(
             !key.is_empty() && key.len() <= 256,
             "report key must contain 1 to 256 bytes"
+        );
+        ensure!(
+            !self
+                .store
+                .workspace_has_uncheckpointed_edits(task.clone())
+                .await?,
+            "checkpoint and release editing state before reporting task completion"
         );
         let encoded = serde_json::to_string(&result)?;
         ensure!(
