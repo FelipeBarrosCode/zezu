@@ -6,6 +6,8 @@ use agent_settings::{AgentProfileId, AgentSettings};
 use anyhow::{Context as _, Result, anyhow};
 use collections::BTreeMap;
 use futures::future::Shared;
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+use gpui::AppContext as _;
 use gpui::{App, AsyncApp, Entity, SharedString, Task};
 use language_model::LanguageModelProviderId;
 use project::Project;
