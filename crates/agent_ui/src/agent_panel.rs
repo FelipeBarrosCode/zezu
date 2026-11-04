@@ -1114,6 +1114,7 @@ impl BaseView {
 }
 
 pub struct AgentPanel {
+    runtime_fleet: Option<Entity<crate::runtime_fleet::RuntimeFleet>>,
     workspace: WeakEntity<Workspace>,
     /// Workspace id is used as a database key
     workspace_id: Option<WorkspaceId>,
@@ -1550,6 +1551,7 @@ impl AgentPanel {
             draft_thread: None,
             persist_selected_agent_task: Task::ready(()),
             retained_threads: HashMap::default(),
+            runtime_fleet: None,
             terminals: HashMap::default(),
             pending_terminal_spawn: None,
             #[cfg(test)]
@@ -6619,6 +6621,7 @@ impl Render for AgentPanel {
             .track_focus(&self.focus_handle)
             .bg(cx.theme().colors().panel_background)
             .on_action(cx.listener(|this, action: &NewThread, window, cx| {
+                this.runtime_fleet = None;
                 this.new_thread(action, window, cx);
             }))
             .on_action(cx.listener(|this, _: &NewTerminalThread, window, cx| {
@@ -6657,42 +6660,72 @@ impl Render for AgentPanel {
                 }
             }))
             .child(self.render_toolbar(window, cx))
+            .child(
+                Button::new(
+                    "toggle-native-fleet",
+                    if self.runtime_fleet.is_some() {
+                        "Back to conversation"
+                    } else {
+                        "Agent fleet"
+                    },
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if this.runtime_fleet.take().is_none() {
+                        match agent::NativeRuntime::global(cx) {
+                            Ok(host) => {
+                                this.runtime_fleet =
+                                    Some(cx.new(|cx| {
+                                        crate::runtime_fleet::RuntimeFleet::new(host, cx)
+                                    }))
+                            }
+                            Err(error) => log::error!("cannot open agent fleet: {error:#}"),
+                        }
+                    }
+                    cx.notify();
+                })),
+            )
             .children(self.render_new_user_onboarding(window, cx))
-            .map(|parent| match self.visible_surface() {
-                VisibleSurface::Uninitialized if !self.has_open_project(cx) => {
-                    parent.child(self.render_no_project_state(cx))
-                }
-                VisibleSurface::Uninitialized => parent,
-                VisibleSurface::AgentThread(conversation_view) => parent
-                    .child(conversation_view.clone())
-                    .child(self.render_drag_target(cx)),
-                VisibleSurface::Terminal(terminal_view) => {
-                    let search_bar = self
-                        .active_terminal_id()
-                        .and_then(|terminal_id| self.terminals.get(&terminal_id))
-                        .and_then(|terminal| terminal.search_bar.clone());
-                    let terminal_content = v_flex()
-                        .size_full()
-                        .when_some(search_bar, |this, search_bar| {
-                            this.when(!search_bar.read(cx).is_dismissed(), |this| {
-                                this.child(
-                                    v_flex()
-                                        .group("toolbar")
-                                        .relative()
-                                        .py(DynamicSpacing::Base06.rems(cx))
-                                        .px(DynamicSpacing::Base08.rems(cx))
-                                        .border_b_1()
-                                        .border_color(cx.theme().colors().border_variant)
-                                        .bg(cx.theme().colors().toolbar_background)
-                                        .child(search_bar),
-                                )
-                            })
-                        })
-                        .child(terminal_view.clone());
+            .map(|parent| {
+                if let Some(fleet) = &self.runtime_fleet {
+                    parent.child(fleet.clone())
+                } else {
+                    match self.visible_surface() {
+                        VisibleSurface::Uninitialized if !self.has_open_project(cx) => {
+                            parent.child(self.render_no_project_state(cx))
+                        }
+                        VisibleSurface::Uninitialized => parent,
+                        VisibleSurface::AgentThread(conversation_view) => parent
+                            .child(conversation_view.clone())
+                            .child(self.render_drag_target(cx)),
+                        VisibleSurface::Terminal(terminal_view) => {
+                            let search_bar = self
+                                .active_terminal_id()
+                                .and_then(|terminal_id| self.terminals.get(&terminal_id))
+                                .and_then(|terminal| terminal.search_bar.clone());
+                            let terminal_content = v_flex()
+                                .size_full()
+                                .when_some(search_bar, |this, search_bar| {
+                                    this.when(!search_bar.read(cx).is_dismissed(), |this| {
+                                        this.child(
+                                            v_flex()
+                                                .group("toolbar")
+                                                .relative()
+                                                .py(DynamicSpacing::Base06.rems(cx))
+                                                .px(DynamicSpacing::Base08.rems(cx))
+                                                .border_b_1()
+                                                .border_color(cx.theme().colors().border_variant)
+                                                .bg(cx.theme().colors().toolbar_background)
+                                                .child(search_bar),
+                                        )
+                                    })
+                                })
+                                .child(terminal_view.clone());
 
-                    parent
-                        .child(terminal_content)
-                        .child(self.render_drag_target(cx))
+                            parent
+                                .child(terminal_content)
+                                .child(self.render_drag_target(cx))
+                        }
+                    }
                 }
             })
             .children(self.render_trial_end_upsell(window, cx));
