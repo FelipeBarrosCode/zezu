@@ -35,6 +35,70 @@ fn store_operations_do_not_require_a_tokio_caller() -> Result<()> {
     })
 }
 
+#[test]
+fn control_operations_use_owned_tokio_and_stop_with_the_app() -> Result<()> {
+    use futures::FutureExt as _;
+    let directory = tempfile::tempdir()?;
+    let store = RuntimeStore::open(
+        directory.path().join("runtime.sqlite"),
+        RuntimeLimits::default(),
+    )?;
+    let runtime = EmbeddedRuntime::start(store, Arc::new(|_| futures::future::pending().boxed()))?;
+    futures::executor::block_on(
+        runtime.execute_control(
+            async {
+                anyhow::ensure!(
+                    tokio::runtime::Handle::try_current().is_ok(),
+                    "control lost the owned Tokio context"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                Ok(())
+            }
+            .boxed(),
+        ),
+    )?;
+    let waiting = runtime.execute_control::<()>(futures::future::pending().boxed());
+    futures::pin_mut!(waiting);
+    assert!(waiting.as_mut().now_or_never().is_none());
+    futures::executor::block_on(runtime.shutdown())?;
+    assert!(futures::executor::block_on(waiting).is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn new_user_turn_fences_terminal_task_identities() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let store = RuntimeStore::open(
+        directory.path().join("runtime.sqlite"),
+        RuntimeLimits::default(),
+    )?;
+    store.create_root("root".into(), json!({})).await?;
+    store
+        .enqueue_text_input("root".into(), "first".into(), "work".into())
+        .await?;
+    let lease = store.admit().await?.context("lease")?;
+    let previous = crate::orchestration::TaskIdentity::from(&lease);
+    store
+        .finish(lease, json!({}), SliceOutcome::Completed)
+        .await?;
+    store
+        .enqueue_text_input("root".into(), "next".into(), "new work".into())
+        .await?;
+    assert!(store.snapshot("root".into()).await?.generation > previous.generation);
+    let orchestrator = crate::orchestration::Orchestrator::open(store.clone()).await?;
+    assert!(
+        orchestrator
+            .report(
+                previous,
+                "late".into(),
+                crate::orchestration::TaskResult::Success(json!("late"))
+            )
+            .await
+            .is_err()
+    );
+    store.shutdown().await
+}
+
 #[tokio::test]
 async fn concurrent_shutdown_callers_wait_for_the_same_checkpoint() -> Result<()> {
     use futures::FutureExt as _;
@@ -443,6 +507,134 @@ async fn failed_history_transaction_rolls_back_prior_rows_and_dedup() -> Result<
 
 struct TestProvider {
     chunks: Vec<StreamChunk>,
+}
+
+struct ParallelCallProvider(usize);
+
+#[async_trait]
+impl ModelProvider for ParallelCallProvider {
+    fn supports_parallel_tool_calls(&self) -> bool {
+        true
+    }
+    async fn list_models(
+        &self,
+    ) -> Result<Vec<ModelEntry>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(vec![model()])
+    }
+    async fn invoke_model(
+        &self,
+        _: &str,
+        _: CompletionRequest,
+    ) -> Result<ModelStream, CompletionError> {
+        let mut chunks = (0..self.0)
+            .map(|index| {
+                StreamChunk::ToolCall(ToolCall::new(format!("call-{index}"), "search", json!({})))
+            })
+            .collect::<Vec<_>>();
+        chunks.push(StreamChunk::Final(FinalResponse::default()));
+        Ok(futures::stream::iter(chunks.into_iter().map(Ok)).boxed())
+    }
+}
+
+#[tokio::test]
+async fn parallel_tool_response_limit_prevents_partial_commits_and_preserves_the_boundary()
+-> Result<()> {
+    use futures::FutureExt as _;
+    for (calls, input_limit, accepted) in
+        [(32, 32, true), (33, 32, false), (2, 2, true), (3, 2, false)]
+    {
+        let directory = tempfile::tempdir()?;
+        let store = RuntimeStore::open(
+            directory.path().join("calls.sqlite"),
+            RuntimeLimits {
+                max_inputs_per_slice: input_limit,
+                ..Default::default()
+            },
+        )?;
+        store.create_root("root".into(), json!({})).await?;
+        let provider: Arc<dyn ModelProvider> = Arc::new(ParallelCallProvider(calls));
+        let factory: SliceFactory = Arc::new(move |_| {
+            let provider = provider.clone();
+            async move {
+                Ok(InfinitySlice {
+                    provider,
+                    model: model(),
+                    tools: vec![ToolDefinition {
+                        name: "search".into(),
+                        description: "search".into(),
+                        parameters: json!({"type":"object"}),
+                    }],
+                    system_prompt: String::new(),
+                })
+            }
+            .boxed()
+        });
+        let runtime = EmbeddedRuntime::start(store.clone(), factory)?;
+        let mut notices = runtime.subscribe();
+        store
+            .enqueue_text_input("root".into(), "user".into(), "search".into())
+            .await?;
+        let notice =
+            tokio::time::timeout(std::time::Duration::from_secs(5), notices.recv()).await??;
+        let backend = SqliteInfinityStore::new(store.clone());
+        let history = backend
+            .load_history_up_to(ThreadId::from_ref("root"), None, None)
+            .await?;
+        let (jobs, dispatched): (usize, usize) = store
+            .read(|connection| {
+                Ok((
+                    connection.query_row("SELECT count(*) FROM jobs", [], |row| row.get(0))?,
+                    connection.query_row(
+                        "SELECT count(*) FROM jobs WHERE state='dispatched'",
+                        [],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .await?;
+        assert_eq!(dispatched, 0, "this scenario installs no effect executor");
+        if accepted {
+            assert!(notice.error.is_none(), "{:?}", notice.error);
+            assert_eq!(
+                jobs, calls,
+                "every allowed parallel call must remain durable"
+            );
+            assert_eq!(
+                history
+                    .iter()
+                    .filter(|message| matches!(message, InfinityMessage::ToolCall { .. }))
+                    .count(),
+                calls
+            );
+            assert_eq!(store.snapshot("root".into()).await?.state, "waiting");
+        } else {
+            assert!(
+                notice
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains(&format!("{input_limit}-tool-call limit"))),
+                "{:?}",
+                notice.error
+            );
+            assert_eq!(
+                jobs, 0,
+                "oversized response must not leave partial tool intents"
+            );
+            assert!(
+                history.is_empty(),
+                "oversized response must not commit partial history"
+            );
+            assert!(
+                backend
+                    .get_processed_ids(ThreadId::from_ref("root"))
+                    .await?
+                    .is_empty()
+            );
+            assert_eq!(store.snapshot("root".into()).await?.state, "paused");
+        }
+        runtime.shutdown().await?;
+    }
+    Ok(())
 }
 
 #[async_trait]

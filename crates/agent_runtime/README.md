@@ -1,145 +1,217 @@
-# Embedded agent runtime
+# Embedded concurrent agent runtime
 
-This crate is the first implementation of Zezu's native concurrent agent runtime.
-It embeds Infinity at revision `1abc6fcff1f186124f924b56aa92c3a3684c90c5` on a
-dedicated Tokio `LocalSet`, with SQLite ownership separate from GPUI.
+Zezu embeds Infinity inside the native Zed application. New native Agent Panel
+sessions submit to this runtime by default; existing legacy sessions retain their
+original connection. The embedded worker owns execution while ACP thread objects
+and the fleet panel project bounded portions of its durable state for display.
+It is not a separate daemon or a cloud execution service.
 
-## Current integration status
+The design supports a large population of logical agents with a bounded number
+of active model requests, tools and editing workspaces. A parked agent is a
+SQLite record, not a live GPUI entity, operating-system thread, model stream or
+worktree. The default logical limit is 75,000 agents **per root run**. This is a
+configured storage/admission limit, not evidence that 75,000 agents can execute
+inference simultaneously or that every editor workload fits in memory.
 
-The runtime executes actual Infinity steps against durable SQLite stores. It is
-a workspace library, not a separate daemon, external ACP agent, or cloud service.
-`NativeAgentServer` attaches an app-owned `NativeRuntime` host to native
-connections. The host starts its database and worker lazily through its native
-API. The existing interactive agent loop continues to run normally, using the
-owned completion preparation boundary; the panel does not submit to Infinity yet.
-The complete K1–K7 and N1–N10 integration is not finished by this change.
+## Application lifecycle and ownership
 
-Implemented foundations:
+`NativeRuntime` is application-owned and starts lazily. It opens
+`agent-runtime.sqlite` in Zed's data directory and runs Infinity on a dedicated
+Tokio `LocalSet`. SQLite has an exclusive process-owner lock, WAL with full
+synchronization, one bounded writer and two bounded reader workers. GPUI callers
+do not need their own Tokio runtime.
 
-- Stable agent IDs, parent relationships and immutable history cutoffs.
-- A bounded database writer and two bounded reader workers; callers can await
-  them without a Tokio runtime on the calling thread.
-- SQLite WAL with full synchronization and an exclusive process owner lock.
-- Per-agent input ordering, durable input IDs and a single active slice lease.
-- Bounded active slices and fairness between root runs, with durable scheduling
-  metadata and no per-parked-agent task or UI entity.
-- Idempotent child creation and a transactional run-wide agent count.
-- Durable tool intents committed with completed tool-call history, before dispatch.
-- Separate job dispatch/completion, duplicate result handling and explicit
-  reconciliation for uncertain effects.
-- Cancellation generations, subtree cancellation, graceful pause requests and
-  restart in paused state.
-- Paginated agent metadata queries and fixed parent history references.
-- Completed-response guards around Infinity's step API. Partial inference is not
-  a durable execution checkpoint.
-- A bounded preparation bridge to Zed's registered model providers. Requests use
-  the existing provider configuration, credentials and provider-side limits.
-- Root and subagent model selection, profile model defaults, supported thinking,
-  effort, speed, temperature and output limits from Zed's existing settings.
-- Native app ownership independent of view handles, synchronous quit cancellation
-  and a shared shutdown result for concurrent shutdown callers.
+The runtime runs only while the application is open. Pause prevents further
+admission and lets active slices reach their boundary. Stop invalidates the
+selected agent generation and its descendants, cancels owned inference/tool
+execution and rejects late results. App shutdown cancels execution and checkpoints
+the store. Concurrent shutdown callers await the same result.
 
-`PreparedLanguageModelCompletion` in `language_model_core` is the shared provider
-execution seam. Zed resolves configuration on the foreground executor; the owned
-execution and stream are polled on the runtime worker. Only admitted slices have
-preparation requests, and both host queues have a fixed capacity of 256.
+Reopening the database leaves unfinished agents paused. The user explicitly
+resumes them. Dispatched effects whose outcome cannot be established become
+`uncertain`; resume does not authorize executing them again. Recovery APIs require
+the effect owner to reconcile the result or obtain the existing permission
+decision. Dirty editing leases and interrupted integrations also require explicit
+recovery rather than automatic reuse.
 
-## Native host API and provider coverage
+The fleet inspector lists up to 20 interrupted tools for the selected agent.
+After inspecting possible effects, the user can choose **Continue without
+retrying**. This records a correlated error acknowledging an unknown outcome;
+it does not claim success, replay the tool or resume the agent automatically.
+Explicit resume or a new user turn remains necessary.
 
-`NativeAgentConnection::runtime` exposes the shared host. Call
-`NativeRuntime::start_database(path, limits, cx)` before `submit_text(config, text)`.
-The native API returns the run ID and exposes the existing store operations and
-bounded runtime notices. Repeated startup accepts the same path and limits and
-rejects another database/configuration. Opening the database happens off the UI
-thread. Recovered agents remain paused; starting the host does not resume them.
+## Scheduling, orchestration and durable effects
 
-`NativeRuntimeConfig` persists model/profile identifiers and an assembled system
-prompt, without credentials. The caller must use the existing project instruction
-and skill loaders to assemble that prompt. This batch applies profile model
-defaults, not profile tool permissions. Children inherit the run prompt and use
-Zed's configured subagent model when set. Explicit unavailable models fail; they
-never silently fall back to another provider. AI-disable settings are checked
-both at configuration resolution and provider preparation.
+`RuntimeStore::admit` grants one generation-fenced slice lease per agent. A slice
+loads a bounded effective history, processes an atomic input batch and executes
+one Infinity model round. Its loaded execution objects are released afterwards.
+Admission is bounded and fair between root runs. There is no task per parked
+agent. Empty admission and job scans remain cached until durable eligibility
+changes, so an unchanged blocked fleet is not rescanned on every worker tick.
 
-The bridge supports text, JSON function calls and correlated results, base64 PNG
-images, plain/signed thinking, redacted thinking, and token usage. Complete tool
-arguments are emitted once. A stop event alone is insufficient to checkpoint:
-the native stream must finish successfully, including any usage events after
-stop. Raw usage/status events can be observed; cache-creation usage is combined
-with input usage in Infinity's narrower usage structure. Durable native usage
-accounting and the panel projection remain integration work.
+Agents have stable IDs, parent IDs and immutable inherited-history cutoffs. The
+orchestrator stores dependency joins and structured child reports in SQLite,
+rejects cycles and cross-run joins, and supports collect and fail-fast policies.
+Waiting on children parks the parent. A child that finishes without pending
+effects reports its final text automatically; explicit reports can carry a
+structured result. Native coordination tools are `runtime_spawn`, `runtime_wait`,
+`runtime_reports` and `runtime_report`.
 
-Unrepresentable fields fail explicitly: provider reasoning details/IDs, tool
-thought signatures, compaction, custom text tool input, distinct secondary call
-IDs, image URLs and non-PNG images. These need protocol extensions or authorized
-conversion before full provider parity. The bridge bounds retained output to
-8 MiB and 256 tool calls per response. Unsupported state, incomplete streams,
-provider errors and truncated/refused output pause the agent without committing
-partial inference. Dropping a slice drops the original Zed provider stream.
+Tool calls and their durable intents commit with history before dispatch. The
+native tool host then uses Zed's existing tool implementations, approval event
+streams and sandbox policy. Effects for one agent are serialized; independent
+agents can use the shared bounded tool pool. The next model round waits until
+the same-generation tool jobs and joins are resolved. Resource waiters park
+durably; revision-aware dispatch avoids repeatedly scanning an unchanged fleet.
 
-## Execution and recovery
+History append and processed input IDs share one SQLite transaction. No database
+transaction spans inference or external tool execution. External effects cannot
+be made exactly once by a local transaction: duplicate result delivery is
+idempotent, but interrupted dispatched work still needs reconciliation.
 
-`RuntimeStore::admit` claims at most one bounded input batch for an agent and
-returns a generation-fenced lease. The worker constructs an `InfinitySlice`
-only after admission. Each slice loads the needed history, runs one model round,
-and drops its loaded execution objects afterwards.
+## Native Zed behavior
 
-Only registered asynchronous tool wrappers are exposed to Infinity. Its default
-synchronous built-ins are disabled because they can invoke additional completions
-inside one step. Each wrapper records an intent; a Zed tool adapter must authorize
-and execute it before reporting completion. Recording or dispatching a job in this
-crate never executes a shell command or MCP operation itself.
+The host reuses registered providers and credentials, selected root/subagent
+models, model parameters, profiles, instructions, AGENTS files, skills, tool
+permissions, MCP transports/authentication and terminal sandbox behavior. Live
+instruction and skill context is prepared on admission. Profile and tool schemas
+are checked again at dispatch. MCP tools retain stable aliases and are exposed
+only when enabled by the current profile.
 
-History and the processed IDs derived from it commit in one SQLite transaction.
-Tool-call history and its outgoing job intent also commit together. This closes
-the upstream split between history append and processed-ID writes for this store.
-No transaction spans inference or tool execution.
+Filesystem, buffer, editing and LSP adapters call the existing Zed implementations.
+Leased projects retain their own edit action log, MCP context and code-action
+handles. Code-action IDs are bounded and checked against the document snapshot.
+Approval requests remain owned by the application when a view closes; the
+runtime never treats a detached view as permission to proceed.
 
-External effects still cannot be made exactly once by a local transaction.
-Dispatched jobs become uncertain on interruption. Reconciliation requires the tool
-owner to verify what happened or obtain the existing permission decision. Resume
-alone never grants permission or authorizes repeating an uncertain effect.
+New runtime sessions use an ACP facade rather than the legacy `Thread` execution
+loop. The selected conversation materializes a bounded transcript projection;
+the fleet panel pages 100 agent rows and 50 transcript entries and coalesces
+refreshes. Model, profile, thinking, effort and speed controls use configuration
+leases: changes are validated while the affected subtree is idle and admission
+is blocked until the change commits or aborts. Concurrent edits cannot change
+configuration underneath an active slice.
 
-Stop invalidates the selected agent generation and its active descendants. A new
-explicit user submission may start another turn; late results from the old turn
-cannot do that. Pause lets active slices reach their boundary and prevents further
-admission. Shutdown drops active inference futures, checkpoints the store and
-releases its owner lock. Owned tool-process termination will be supplied by the
-Zed job adapter; no process executor is installed here yet.
+## Isolated editing and integration
 
-## Remaining integration gates
+Editing uses a bounded pool of detached Git worktrees. Agents acquire a
+generation-fenced workspace lease, operate through its native Zed project,
+checkpoint an artifact and release a clean workspace. The pool is shared across
+the fleet; it does not create one worktree per parked agent. Artifact refs keep
+checkpoint commits reachable across cleanup and recovery.
 
-1. Connect panel submissions and error presentation to the native runtime API
-   after permission handling and bounded UI projections are available.
-2. Extend the protocol for the unsupported provider fields above, preserve full
-   usage accounting, and verify every supported provider end to end.
-3. Bind existing independent tools and narrow project, buffer and LSP bridges to
-   the durable job broker. Preserve instruction, skill, MCP and approval behavior.
-4. Add parent reports and dependency joins. Existing child IDs and inherited
-   history provide storage primitives; a complete orchestration graph is not
-   implemented yet.
-5. Replace eager child views and native-thread access with bounded projections.
-6. Add workspace leases, recoverable editing artifacts, configured checks and
-   serialized integration with selective revert.
-7. Wire resource settings, tool/workspace admission and memory accounting. Tune
-   adaptive caches and resource defaults using representative workloads.
-8. Exercise crash injection, live-provider paths and the full editor under load.
+The workspace and integration tools are:
 
-## Validation
+- `runtime_workspace_acquire`, `runtime_workspace_checkpoint` and
+  `runtime_workspace_release`;
+- `runtime_integrate` and `runtime_revert` when configured and permitted.
+
+Integration runs the user's configured checks in an isolated staging worktree,
+then serializes publication to the target branch with compare-and-swap checks.
+Failures or conflicts leave the target unchanged. A selective revert validates
+the inverse change while preserving unrelated later work. Integration checks and
+the target branch come from application settings, not model-supplied arguments.
+Automatic integration runs after a successful checkpoint only when checks are
+configured and the current profile permits integration. Disabling
+`runtime_integrate` also disables that automatic path.
+
+Isolated editing currently requires a trusted **local Git project**. Remote and
+non-Git projects do not gain equivalent editing isolation from this runtime.
+Restricted worktrees retain metadata-only orchestration. Missing checks disable
+integration; they do not cause unchecked publication.
+
+## Providers, context and accounting
+
+`PreparedLanguageModelCompletion` is the shared provider execution seam. Zed
+resolves configuration on the foreground executor; owned request/stream futures
+run on the embedded worker. Explicitly unavailable models fail instead of falling
+back silently. AI-disable settings apply at configuration and preparation.
+
+The vendored Infinity crates retain their Apache-2.0 license and pinned upstream
+revision; see their `UPSTREAM.md` files. Local protocol extensions preserve native
+reasoning details, signed/redacted reasoning, raw and custom tool input, tool
+signatures, native compaction state and tool-result error/output data. Parallel
+asynchronous tool calls are dispatched only after the durable history barrier.
+Unsigned reasoning and complete parallel response handling are opt-in provider
+capabilities, preserving upstream behavior for other providers.
+
+Provider attempts and exact native token usage are recorded durably. Partial
+inference is not a checkpoint: the original native stream must finish
+successfully, including usage events after a stop event. Errors, truncation and
+unsupported state pause the agent without committing a partial response. Dropping
+the slice drops the original provider stream.
+
+Manual `/compact` and configured automatic compaction use the native compaction
+model/provider path. Compaction writes an effective-context checkpoint while
+retaining the immutable archive and inherited-history boundaries. Installation
+is fenced against generation and configuration changes. Native explicit
+compaction is used when supported; otherwise bounded transcript pages feed the
+summary path. Typed provider context-overflow state can trigger recovery without
+matching error strings.
+
+The generic bridge accepts base64 PNG images. URL images require an authorized
+tool to resolve them before inference; non-PNG input needs conversion. Foreign
+protocol-only secondary call/result IDs that cannot be represented by the native
+provider state fail explicitly. Preserving native provider fields is not a claim
+that every registered provider has been exercised against its live service.
+
+## Settings and bounds
+
+Configure these under `agent.runtime` in Zed settings:
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | Use the embedded runtime for new native sessions |
+| `max_agents` | `75000` | Logical agents in one root run |
+| `max_active_agents` | `16` | Concurrent admitted inference slices |
+| `max_tool_jobs` | `8` | Concurrent native tool jobs |
+| `max_workspaces` | `4` | Editing workspace leases held at once |
+| `max_queued_jobs` | `256` | Bounded admitted command/job capacity |
+| `max_memory_bytes` | `536870912` | Shared retained execution-byte budget |
+| `integration_checks` | empty | Check programs, argument arrays and timeouts |
+| `target_branch` | current branch | Integration destination; required for detached HEAD |
+| `auto_integrate` | `true` | Integrate checkpoints when checks and permissions allow |
+
+Limits must be positive; the native tool host accepts 1–256 active tool jobs.
+Active inference is capped by the logical-agent limit.
+An already-open runtime rejects a different database/limit configuration; change
+startup limits before starting it or restart the application. Model/profile
+controls use the separate per-run configuration lease path described above.
+
+The execution-byte budget accounts for retained runtime work; it is **not** a
+hard cap on whole-editor RSS, provider-library allocations, language servers or
+filesystem caches. Effective history is preflighted against a 32 MiB budget before
+deserialization. Other guards include 1 MiB per input, 32 inputs per slice, 8 MiB
+retained model output and at most `min(256, max_inputs_per_slice)` completed tool
+calls per response (32 by default). An oversized response pauses before any of
+its history or jobs commit, so sibling results fit one bounded input slice.
+Resource admission and
+provider cooldown prevent these independently bounded operations from all
+becoming active at once.
+
+## Validation and remaining coverage
+
+Useful focused commands from the repository root:
 
 ```sh
-cargo test -p agent_runtime -p language_model_core --lib
-cargo test -p agent --lib native_runtime::tests
+cargo test -p agent_runtime --lib
+cargo test -p infinity-agent-core -p infinity-provider-protocol --lib
+cargo test -p agent --lib runtime_
+cargo check -p agent -p agent_ui
 ./script/clippy -p agent_runtime
-cargo test -p agent_runtime large_parked_fleet_uses_paged_metadata -- --ignored --nocapture
+cargo test -p agent_runtime --lib -- --ignored --nocapture
 ```
 
-Native integration tests drive Zed's fake registered provider through the actual
-Infinity worker and SQLite store. They cover detached handles, configured root
-and subagent models, provider-state rejection, and app-quit cancellation with a
-paused reopen. No live model credentials or paid requests are used.
+The explicit capacity tests seed 75,000 parked metadata/jobs, exercise bounded
+pagination, dispatch-scan caching and recovery/admission, and report measurements
+for their synthetic workload. They use no live model requests. Native integration
+tests use Zed's registered fake provider and real Infinity/SQLite paths, including
+tool approvals, project isolation, cancellation and paused recovery.
 
-The explicit capacity test seeds 75,000 parked metadata records and checks bounded
-pagination, idle admission and enforcement of the total-agent limit. It does not
-run 75,000 inference streams, create 75,000 worktrees, measure total editor memory,
-or establish a supported production capacity.
+These tests do not establish 75,000 simultaneous model streams, a full editor RAM
+ceiling or production throughput. Live-provider matrices, prolonged full-editor
+load, remote editing parity, and platform-specific process-tree termination need
+separate validation. Unix process groups are used for owned Git/check processes;
+equivalent Windows descendant-process containment has not been established by
+the Linux test suite. Upstream socket-transport tests also require an environment
+that permits local socket binding.

@@ -13,6 +13,8 @@ pub mod projection;
 #[cfg(test)]
 mod provider_engine_tests;
 pub mod provider_state;
+#[cfg(test)]
+mod recovery_tests;
 pub mod resource;
 mod runtime;
 mod store;
