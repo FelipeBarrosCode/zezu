@@ -17,7 +17,7 @@ use infinity_agent_core::{
 };
 use tokio::sync::{broadcast, watch};
 
-use crate::{AgentSnapshot, InfinitySlice, Lease, RuntimeStore};
+use crate::{AdmissionCursor, AgentSnapshot, InfinitySlice, Lease, RuntimeStore};
 
 pub type SliceFactory =
     Arc<dyn Fn(AgentSnapshot) -> BoxFuture<'static, Result<InfinitySlice>> + Send + Sync>;
@@ -215,13 +215,14 @@ async fn drive_inner(
     let mut active = HashMap::<String, (Lease, AbortHandle)>::new();
     let mut tasks = FuturesUnordered::<SliceTask>::new();
     let mut control_tasks = FuturesUnordered::<BoxFuture<'static, ()>>::new();
+    let mut admission = AdmissionCursor::default();
     let mut tick = tokio::time::interval(Duration::from_millis(25));
     loop {
         if *stop.borrow() {
             break;
         }
         while active.len() < store.limits().max_active_agents {
-            let Some(lease) = store.admit().await? else {
+            let Some(lease) = admission.poll(&store).await? else {
                 break;
             };
             let snapshot = store.snapshot(lease.agent_id.clone()).await?;

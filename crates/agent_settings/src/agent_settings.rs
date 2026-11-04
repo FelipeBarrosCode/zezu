@@ -209,6 +209,7 @@ fn parse_auto_compact_threshold(raw: &str) -> anyhow::Result<AutoCompactThreshol
 
 #[derive(Clone, Debug, RegisterSetting)]
 pub struct AgentSettings {
+    pub runtime: settings::NativeRuntimeSettings,
     pub enabled: bool,
     pub button: bool,
     pub dock: DockPosition,
@@ -771,6 +772,7 @@ impl Settings for AgentSettings {
         let agent = content.agent.clone().unwrap();
         let threads_sidebar = agent.threads_sidebar.unwrap();
         Self {
+            runtime: agent.runtime.clone().unwrap_or_default(),
             enabled: agent.enabled.unwrap(),
             button: agent.button.unwrap(),
             dock: agent.dock.unwrap(),

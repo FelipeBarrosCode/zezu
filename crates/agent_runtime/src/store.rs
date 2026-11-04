@@ -138,11 +138,13 @@ impl RuntimeStore {
             "unsupported runtime database version: {version}"
         );
         crate::jobs::initialize_connection(&connection)?;
+        crate::configuration::initialize_connection(&connection)?;
         crate::compaction::initialize(&connection)?;
         crate::workspaces::WorkspacePool::initialize_connection(&connection)?;
         crate::input_batches::initialize(&connection)?;
         crate::orchestration::Orchestrator::initialize_connection(&connection)?;
         crate::projection::initialize(&connection)?;
+        crate::admission::initialize_connection(&connection)?;
         recover(&mut connection)?;
         crate::orchestration::Orchestrator::recover_connection(&connection)?;
         Self::recover_workspace_waits(&connection)?;
@@ -346,7 +348,7 @@ impl RuntimeStore {
             let next: Option<(String,String,i64)> = transaction.query_row(
                 "SELECT agents.id,root_id,generation FROM agents JOIN runs ON root_id=runs.id
                  WHERE state='queued' AND closed=0 AND pause_requested=0
-
+                 AND NOT EXISTS(SELECT 1 FROM runtime_configuration_blocked blocked WHERE blocked.agent_id=agents.id)
                  AND NOT EXISTS(SELECT 1 FROM jobs WHERE jobs.agent_id=agents.id AND jobs.state='uncertain')
                  AND NOT EXISTS(SELECT 1 FROM jobs WHERE jobs.agent_id=agents.id AND jobs.generation=agents.generation AND jobs.state IN ('queued','dispatched'))
                  AND NOT EXISTS(SELECT 1 FROM runtime_joins j WHERE j.agent_id=agents.id AND j.generation=agents.generation AND j.state='pending')
@@ -414,6 +416,7 @@ impl RuntimeStore {
 
     pub async fn pause(&self, agent_id: String) -> Result<()> {
         self.write(move |connection| {
+            crate::configuration::ensure_scope_unlocked(connection, &agent_id)?;
             let changed = connection.execute(
                 "WITH RECURSIVE scope(id) AS (SELECT id FROM agents WHERE id=? UNION ALL SELECT a.id FROM agents a JOIN scope s ON a.parent_id=s.id)
                  UPDATE agents SET pause_requested=1,state=CASE WHEN state IN ('queued','waiting') THEN 'paused' ELSE state END
@@ -427,6 +430,7 @@ impl RuntimeStore {
     pub async fn resume(&self, agent_id: String) -> Result<()> {
         self.write(move |connection| {
             let transaction = connection.transaction()?;
+            crate::configuration::ensure_scope_unlocked(&transaction, &agent_id)?;
             transaction.execute(
                 "WITH RECURSIVE scope(id) AS (SELECT id FROM agents WHERE id=? UNION ALL SELECT a.id FROM agents a JOIN scope s ON a.parent_id=s.id)
                  UPDATE agents SET pause_requested=0,state=CASE WHEN EXISTS(SELECT 1 FROM inbox WHERE agent_id=agents.id AND processed=0) THEN 'queued' ELSE 'waiting' END
@@ -510,7 +514,7 @@ impl RuntimeStore {
     pub async fn dispatch_job(&self, id: String) -> Result<Job> {
         self.write(move |connection| {
             let transaction = connection.transaction()?;
-            let changed = transaction.execute("UPDATE jobs SET state='dispatched' WHERE id=? AND state='queued' AND EXISTS(SELECT 1 FROM agents WHERE agents.id=jobs.agent_id AND agents.generation=jobs.generation AND pause_requested=0  AND state IN ('queued','running','waiting'))", [&id])?;
+            let changed = transaction.execute("UPDATE jobs SET state='dispatched' WHERE id=? AND state='queued' AND EXISTS(SELECT 1 FROM agents WHERE agents.id=jobs.agent_id AND agents.generation=jobs.generation AND pause_requested=0 AND NOT EXISTS(SELECT 1 FROM runtime_configuration_blocked blocked WHERE blocked.agent_id=agents.id) AND state IN ('queued','running','waiting'))", [&id])?;
             ensure!(changed == 1, "job cannot be dispatched in its current state");
             let job = load_job(&transaction, &id)?;
             transaction.commit()?;
@@ -664,6 +668,7 @@ fn recover(connection: &mut Connection) -> Result<()> {
         "UPDATE jobs SET state='uncertain' WHERE state='dispatched'",
         [],
     )?;
+    crate::configuration::recover_connection(&transaction)?;
     transaction.commit()?;
     Ok(())
 }
@@ -705,6 +710,7 @@ pub(crate) fn spawn_child(
 ) -> Result<String> {
     ensure!(cutoff >= 0, "negative history cutoff");
     let transaction = connection.transaction()?;
+    crate::configuration::ensure_scope_unlocked(&transaction, parent)?;
     let parent_state: (String, String, bool) = transaction.query_row(
         "SELECT root_id,state,pause_requested FROM agents WHERE id=?",
         [parent],
@@ -769,6 +775,9 @@ pub(crate) fn enqueue(
         [agent_id],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
+    if user {
+        crate::configuration::ensure_scope_unlocked(connection, agent_id)?;
+    }
     ensure!(!closed, "thread is closed");
     ensure!(
         user || !matches!(state.as_str(), "cancelled" | "completed" | "failed"),

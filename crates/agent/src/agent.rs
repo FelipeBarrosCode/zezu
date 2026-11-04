@@ -11,7 +11,9 @@ pub use runtime_tools::{
 };
 pub mod outline;
 mod pattern_extraction;
+pub mod runtime_compaction;
 pub mod runtime_context;
+pub mod runtime_orchestration;
 pub mod runtime_project;
 pub mod runtime_workspaces;
 mod sandboxing;
@@ -27,7 +29,7 @@ use context_server::ContextServerId;
 pub use db::*;
 use itertools::Itertools;
 pub use native_agent_server::NativeAgentServer;
-pub use native_runtime::{NativeRuntime, NativeRuntimeConfig};
+pub use native_runtime::{NativeRuntime, NativeRuntimeConfig, RuntimeContextLoader};
 use parking_lot::Mutex;
 pub use pattern_extraction::*;
 pub use sandboxing::{

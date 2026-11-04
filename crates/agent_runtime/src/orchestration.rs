@@ -321,6 +321,7 @@ fn policy_name(policy: FailurePolicy) -> &'static str {
 }
 
 fn validate_identity(connection: &Connection, task: &TaskIdentity) -> Result<String> {
+    crate::configuration::ensure_scope_unlocked(connection, &task.agent_id)?;
     let (root, generation, state): (String, i64, String) = connection.query_row(
         "SELECT root_id,generation,state FROM agents WHERE id=?",
         [&task.agent_id],

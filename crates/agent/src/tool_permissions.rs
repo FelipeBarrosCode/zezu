@@ -568,6 +568,7 @@ mod tests {
 
     fn test_agent_settings(tool_permissions: ToolPermissions) -> AgentSettings {
         AgentSettings {
+            runtime: Default::default(),
             enabled: true,
             button: true,
             dock: DockPosition::Right,

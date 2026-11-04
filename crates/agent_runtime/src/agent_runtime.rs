@@ -1,4 +1,6 @@
+mod admission;
 pub mod compaction;
+mod configuration;
 pub mod history_budget;
 mod infinity;
 mod input_batches;
@@ -18,6 +20,7 @@ mod store;
 mod tests;
 pub mod workspaces;
 
+pub use admission::AdmissionCursor;
 pub use infinity::{InfinitySlice, SqliteInfinityStore};
 pub use projection::{FleetSummary, HistoryReference, TranscriptEntry, TranscriptPage};
 pub use runtime::{EmbeddedRuntime, RuntimeNotice, RuntimeNoticeReceiver, SliceFactory};
@@ -67,4 +70,5 @@ impl RuntimeLimits {
     }
 }
 
+pub use configuration::ConfigurationLease;
 pub use jobs::{JobDispatchCursor, UncertainJob};

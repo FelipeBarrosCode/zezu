@@ -216,7 +216,38 @@ pub struct AutoCompactSettingsContent {
 
 #[with_fallible_options]
 #[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, Default)]
+pub struct NativeRuntimeSettings {
+    pub integration_checks: Option<Vec<NativeRuntimeCheck>>,
+    pub target_branch: Option<String>,
+    pub auto_integrate: Option<bool>,
+    /// Use the embedded concurrent runtime for native agent sessions.
+    pub enabled: Option<bool>,
+    /// Maximum logical agents in one root run. Default: 75000.
+    pub max_agents: Option<usize>,
+    /// Maximum admitted inference slices. Default: 16.
+    pub max_active_agents: Option<usize>,
+    /// Maximum concurrently executing native tools. Default: 8.
+    pub max_tool_jobs: Option<usize>,
+    /// Maximum editing workspaces held at once. Default: 4.
+    pub max_workspaces: Option<usize>,
+    /// Maximum admitted queued jobs. Default: 256.
+    pub max_queued_jobs: Option<usize>,
+    /// Retained execution byte budget. Default: 536870912.
+    pub max_memory_bytes: Option<usize>,
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
+pub struct NativeRuntimeCheck {
+    pub program: String,
+    #[serde(default)]
+    pub arguments: Vec<String>,
+    pub timeout_seconds: u64,
+}
+
+#[with_fallible_options]
+#[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, Default)]
 pub struct AgentSettingsContent {
+    pub runtime: Option<NativeRuntimeSettings>,
     /// Whether the Agent is enabled.
     ///
     /// Default: true
@@ -1521,5 +1552,18 @@ mod tests {
             serde_json::to_value(&resolved).unwrap(),
             serde_json::json!({ "requested": "/tmp/x", "resolved": "/tmp/real" })
         );
+    }
+    #[test]
+    fn native_runtime_settings_preserve_explicit_disable_and_partial_limits() {
+        let settings: AgentSettingsContent = serde_json::from_value(serde_json::json!({
+            "runtime": { "enabled": false, "max_agents": 300, "max_tool_jobs": 2 }
+        }))
+        .expect("runtime settings");
+        let runtime = settings.runtime.expect("runtime");
+        assert_eq!(runtime.enabled, Some(false));
+        assert_eq!(runtime.max_agents, Some(300));
+        assert_eq!(runtime.max_tool_jobs, Some(2));
+        assert_eq!(runtime.max_active_agents, None);
+        assert_eq!(NativeRuntimeSettings::default().enabled, None);
     }
 }
