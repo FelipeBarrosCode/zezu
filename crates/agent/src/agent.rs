@@ -5,6 +5,8 @@ mod native_runtime;
 pub mod runtime_mcp;
 pub mod runtime_terminal;
 mod runtime_tools;
+#[cfg(test)]
+mod runtime_workflow_tests;
 pub use runtime_tools::{
     RuntimeInternalExecutor, RuntimeToolContext, RuntimeToolEventSink, RuntimeToolHost,
     RuntimeToolPreparation, RuntimeToolResolver,
