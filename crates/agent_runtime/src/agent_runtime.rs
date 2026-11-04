@@ -4,6 +4,7 @@ mod infinity;
 mod input_batches;
 mod jobs;
 pub mod model;
+pub mod orchestration;
 pub mod projection;
 #[cfg(test)]
 mod provider_engine_tests;

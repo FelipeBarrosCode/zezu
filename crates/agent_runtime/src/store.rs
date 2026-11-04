@@ -140,8 +140,10 @@ impl RuntimeStore {
         crate::jobs::initialize_connection(&connection)?;
         crate::compaction::initialize(&connection)?;
         crate::input_batches::initialize(&connection)?;
+        crate::orchestration::Orchestrator::initialize_connection(&connection)?;
         crate::projection::initialize(&connection)?;
         recover(&mut connection)?;
+        crate::orchestration::Orchestrator::recover_connection(&connection)?;
         let mut readers = Vec::new();
         for _ in 0..2 {
             let reader =
@@ -345,6 +347,7 @@ impl RuntimeStore {
 
                  AND NOT EXISTS(SELECT 1 FROM jobs WHERE jobs.agent_id=agents.id AND jobs.state='uncertain')
                  AND NOT EXISTS(SELECT 1 FROM jobs WHERE jobs.agent_id=agents.id AND jobs.generation=agents.generation AND jobs.state IN ('queued','dispatched'))
+                 AND NOT EXISTS(SELECT 1 FROM runtime_joins j WHERE j.agent_id=agents.id AND j.generation=agents.generation AND j.state='pending')
                  AND EXISTS(SELECT 1 FROM inbox WHERE agent_id=agents.id AND processed=0)
                  ORDER BY runs.last_admitted,agents.last_admitted,agents.id LIMIT 1",
                 [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
@@ -388,6 +391,7 @@ impl RuntimeStore {
                 SliceOutcome::Waiting => "waiting",
             };
             transaction.execute("UPDATE agents SET checkpoint=?,lease_id=NULL,state=CASE WHEN closed=1 THEN 'completed' WHEN pause_requested=1 AND ? IN ('queued','waiting') THEN 'paused' ELSE ? END WHERE id=?", params![checkpoint,state,state,lease.agent_id])?;
+            crate::orchestration::Orchestrator::reconcile_connection(&transaction, &lease.agent_id)?;
             transaction.commit()?;
             Ok(())
         }).await
@@ -399,6 +403,7 @@ impl RuntimeStore {
             check_lease(&transaction, &lease)?;
             transaction.execute("UPDATE inbox SET lease_id=NULL WHERE agent_id=? AND lease_id=?", params![lease.agent_id,lease.id])?;
             transaction.execute("UPDATE agents SET state='paused',pause_requested=1,lease_id=NULL,generation=generation+1 WHERE id=?", [&lease.agent_id])?;
+            crate::orchestration::Orchestrator::rebind_task(&transaction, &lease.agent_id)?;
             transaction.execute("UPDATE jobs SET state='uncertain' WHERE agent_id=? AND state='dispatched'", [&lease.agent_id])?;
             transaction.commit()?;
             Ok(())
@@ -444,6 +449,11 @@ impl RuntimeStore {
             // for a later explicit user turn, including an unknown-outcome acknowledgement.
             transaction.execute("UPDATE inbox SET processed=CASE WHEN EXISTS(SELECT 1 FROM jobs WHERE jobs.agent_id=inbox.agent_id AND jobs.state='completed' AND jobs.result=inbox.payload) THEN processed ELSE 1 END,lease_id=NULL WHERE agent_id IN (SELECT id FROM agents WHERE state='cancelled')", [])?;
             transaction.execute("UPDATE jobs SET state=CASE WHEN state='dispatched' THEN 'uncertain' ELSE 'cancelled' END WHERE state IN ('queued','dispatched') AND agent_id IN (SELECT id FROM agents WHERE state='cancelled')", [])?;
+            let affected = {
+                let mut statement = transaction.prepare("WITH RECURSIVE scope(id) AS (SELECT id FROM agents WHERE id=? UNION ALL SELECT a.id FROM agents a JOIN scope s ON a.parent_id=s.id) SELECT id FROM scope")?;
+                statement.query_map([&agent_id], |row| row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for id in affected { crate::orchestration::Orchestrator::reconcile_connection(&transaction,&id)?; }
             transaction.commit()?;
             Ok(())
         }).await
@@ -782,6 +792,7 @@ pub(crate) fn enqueue(
     )? == 1;
     if inserted {
         if user && matches!(state.as_str(), "completed" | "failed" | "cancelled") {
+            crate::orchestration::Orchestrator::rebind_task(connection, agent_id)?;
             connection.execute(
                 "UPDATE agents SET generation=generation+1 WHERE id=?",
                 [agent_id],
