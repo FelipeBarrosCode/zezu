@@ -6,7 +6,12 @@ use fs::Fs;
 use gpui::{App, Entity, Task};
 use project::{AgentId, Project};
 
-use crate::{NativeAgent, NativeAgentConnection, NativeRuntime, ThreadStore, templates::Templates};
+use crate::{
+    NativeAgent, NativeAgentConnection, NativeRuntime, NativeRuntimeConnection, ThreadStore,
+    templates::Templates,
+};
+use agent_settings::AgentSettings;
+use settings::Settings as _;
 
 #[derive(Clone)]
 pub struct NativeAgentServer {
@@ -45,7 +50,7 @@ impl AgentServer for NativeAgentServer {
             log::debug!("Creating native agent entity");
             let agent = cx.update(|cx| {
                 let runtime = NativeRuntime::global(cx)?;
-                let agent = NativeAgent::new(thread_store, templates, fs, cx);
+                let agent = NativeAgent::new(thread_store, templates, fs.clone(), cx);
                 agent.update(cx, |agent, _| agent.runtime = Some(runtime));
                 anyhow::Ok(agent)
             })?;
@@ -53,8 +58,20 @@ impl AgentServer for NativeAgentServer {
             // Create the connection wrapper
             let connection = NativeAgentConnection(agent);
             log::debug!("NativeAgentServer connection established successfully");
-
-            Ok(Rc::new(connection) as Rc<dyn acp_thread::AgentConnection>)
+            let enabled = cx.update(|cx| {
+                AgentSettings::get_global(cx)
+                    .runtime
+                    .enabled
+                    .unwrap_or(true)
+            });
+            if enabled {
+                let host = cx.update(|cx| NativeRuntime::global(cx))?;
+                host.update(cx, |host, cx| host.start_default(cx)).await?;
+                Ok(Rc::new(NativeRuntimeConnection::new(connection, host, fs))
+                    as Rc<dyn acp_thread::AgentConnection>)
+            } else {
+                Ok(Rc::new(connection) as Rc<dyn acp_thread::AgentConnection>)
+            }
         })
     }
 

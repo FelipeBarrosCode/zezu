@@ -1568,11 +1568,7 @@ impl ConversationView {
         let agent_id = self.agent.agent_id();
         let connection = thread.read(cx).connection().clone();
         let session_id = thread.read(cx).session_id().clone();
-        let available_skills = connection
-            .clone()
-            .downcast::<agent::NativeAgentConnection>()
-            .map(|native_connection| native_available_skills(&native_connection, &session_id, cx))
-            .unwrap_or_default();
+        let available_skills = native_available_skills(&connection, &session_id, cx);
         let session_capabilities = Arc::new(RwLock::new(SessionCapabilities::new(
             thread.read(cx).prompt_capabilities().clone(),
             thread.read(cx).available_commands().to_vec(),
@@ -1636,27 +1632,20 @@ impl ConversationView {
         let connection = thread.read(cx).connection().clone();
         let session_id = thread.read(cx).session_id().clone();
 
-        // Check for config options first
-        // Config options take precedence over legacy mode/model selectors
         let config_options_provider = connection.session_config_options(&session_id, cx);
-
-        let config_options_view;
-        let mode_selector;
-        let model_selector;
-        if let Some(config_options) = config_options_provider {
-            // Use config options - don't create mode_selector or model_selector
+        let supplemental_native_options = connection
+            .clone()
+            .downcast::<agent::NativeRuntimeConnection>()
+            .is_some();
+        let config_options_view = config_options_provider.map(|config_options| {
             let agent_server = self.agent.clone();
             let fs = self.project.read(cx).fs().clone();
-            config_options_view =
-                Some(cx.new(|cx| {
-                    ConfigOptionsView::new(config_options, agent_server, fs, window, cx)
-                }));
-            model_selector = None;
-            mode_selector = None;
-        } else {
-            // Fall back to dedicated mode/model selectors
-            config_options_view = None;
-            model_selector = connection.model_selector(&session_id).map(|selector| {
+            cx.new(|cx| ConfigOptionsView::new(config_options, agent_server, fs, window, cx))
+        });
+        // Native reasoning/speed controls supplement the existing model and profile pickers.
+        let dedicated_selectors = config_options_view.is_none() || supplemental_native_options;
+        let model_selector = if dedicated_selectors {
+            connection.model_selector(&session_id).map(|selector| {
                 cx.new(|cx| {
                     ModelSelectorPopover::new(
                         selector,
@@ -1666,15 +1655,20 @@ impl ConversationView {
                         cx,
                     )
                 })
-            });
-
-            mode_selector = connection
+            })
+        } else {
+            None
+        };
+        let mode_selector = if dedicated_selectors {
+            connection
                 .session_modes(&session_id, cx)
                 .map(|session_modes| {
                     let fs = self.project.read(cx).fs().clone();
                     cx.new(|_cx| ModeSelector::new(session_modes, self.agent.clone(), fs))
-                });
-        }
+                })
+        } else {
+            None
+        };
 
         let subscriptions = vec![
             cx.subscribe_in(&thread, window, Self::handle_thread_event),
@@ -2293,15 +2287,8 @@ impl ConversationView {
             }
             AcpThreadEvent::AvailableCommandsUpdated(available_commands) => {
                 if let Some(thread_view) = self.thread_view(&session_id) {
-                    let available_skills = thread
-                        .read(cx)
-                        .connection()
-                        .clone()
-                        .downcast::<agent::NativeAgentConnection>()
-                        .map(|native_connection| {
-                            native_available_skills(&native_connection, &session_id, cx)
-                        })
-                        .unwrap_or_default();
+                    let available_skills =
+                        native_available_skills(thread.read(cx).connection(), &session_id, cx);
                     let has_slash_completions =
                         !available_commands.is_empty() || !available_skills.is_empty();
 
@@ -3883,12 +3870,24 @@ fn loading_contents_spinner(size: IconSize) -> AnyElement {
 }
 
 fn native_available_skills(
-    native_connection: &agent::NativeAgentConnection,
+    connection: &Rc<dyn acp_thread::AgentConnection>,
     session_id: &acp_v2::SessionId,
     cx: &App,
 ) -> Vec<AvailableSkill> {
-    native_connection
-        .available_skills(session_id, cx)
+    let skills = if let Some(native) = connection
+        .clone()
+        .downcast::<agent::NativeAgentConnection>()
+    {
+        native.available_skills(session_id, cx)
+    } else if let Some(runtime) = connection
+        .clone()
+        .downcast::<agent::NativeRuntimeConnection>()
+    {
+        runtime.available_skills(session_id, cx)
+    } else {
+        Vec::new()
+    };
+    skills
         .into_iter()
         .map(|skill| AvailableSkill {
             name: skill.name.into(),

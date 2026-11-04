@@ -652,7 +652,27 @@ impl MentionSet {
         let connection = server.connect(delegate, project.clone(), cx);
         cx.spawn(async move |_, cx| {
             let agent = connection.await?;
-            let agent = agent.downcast::<agent::NativeAgentConnection>().unwrap();
+            if let Some(runtime) = agent.clone().downcast::<agent::NativeRuntimeConnection>() {
+                if id.0.starts_with("runtime:") {
+                    let summary = cx.update(|cx| runtime.summary(&id, cx)).await?;
+                    return Ok(Mention::Text {
+                        content: summary.to_string(),
+                        tracked_buffers: Vec::new(),
+                    });
+                }
+                let summary = runtime
+                    .legacy()
+                    .0
+                    .update(cx, |agent, cx| agent.thread_summary(id, project, cx))
+                    .await?;
+                return Ok(Mention::Text {
+                    content: summary.to_string(),
+                    tracked_buffers: Vec::new(),
+                });
+            }
+            let agent = agent
+                .downcast::<agent::NativeAgentConnection>()
+                .context("native connection is unavailable")?;
             let summary = agent
                 .0
                 .update(cx, |agent, cx| {

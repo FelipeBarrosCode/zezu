@@ -431,7 +431,9 @@ impl NativeRuntime {
                                     .cloned()
                             })?;
                             if let Some(view) = view {
-                                project_runtime_tool_event(&view, event, cx)?;
+                                crate::runtime_connection::project_runtime_tool_event(
+                                    &view, event, cx,
+                                )?;
                             }
                             Ok(())
                         },
@@ -1146,87 +1148,4 @@ mod tests {
             assert!(resolve_configuration(agent, NativeRuntimeConfig::default(), cx).is_err());
         });
     }
-}
-
-fn project_runtime_tool_event(
-    view: &WeakEntity<AcpThread>,
-    event: &mut Option<crate::ThreadEvent>,
-    cx: &mut App,
-) -> Result<()> {
-    let Some(thread) = view.upgrade() else {
-        return Ok(());
-    };
-    let Some(event) = event.take() else {
-        return Ok(());
-    };
-    match event {
-        crate::ThreadEvent::ToolCallUpdate(update) => {
-            thread.update(cx, |thread, cx| thread.update_tool_call(update, cx))?
-        }
-        crate::ThreadEvent::ToolCallAuthorization(authorization) => {
-            let task = thread.update(cx, |thread, cx| {
-                thread.request_tool_call_update_authorization(
-                    authorization.tool_call,
-                    authorization.options,
-                    authorization.kind,
-                    cx,
-                )
-            })?;
-            cx.spawn(async move |_| {
-                if let acp_thread::RequestPermissionOutcome::Selected(outcome) = task.await {
-                    if authorization.response.send(outcome).is_err() {
-                        log::debug!("runtime approval requester detached");
-                    }
-                }
-            })
-            .detach();
-        }
-        crate::ThreadEvent::ToolCallAuthorizationResolved {
-            tool_call_id,
-            outcome,
-        } => thread.update(cx, |thread, cx| {
-            thread.authorize_tool_call(tool_call_id, outcome, cx)
-        }),
-        crate::ThreadEvent::Elicitation(request) => {
-            let task = thread.update(cx, |thread, cx| {
-                let scope = agent_client_protocol::v2::schema::ElicitationSessionScope::new(
-                    thread.session_id().clone(),
-                )
-                .tool_call_id(request.tool_call_id);
-                thread.request_elicitation(
-                    agent_client_protocol::v2::schema::CreateElicitationRequest::new(
-                        agent_client_protocol::v2::schema::ElicitationFormMode::new(
-                            scope,
-                            request.schema,
-                        ),
-                        request.message,
-                    ),
-                    cx,
-                )
-            })?;
-            cx.spawn(async move |_| {
-                if request.response.send(task.await).is_err() {
-                    log::debug!("runtime elicitation requester detached");
-                }
-            })
-            .detach();
-        }
-        crate::ThreadEvent::AgentText(text) => thread.update(cx, |thread, cx| {
-            thread.push_assistant_content_block(text.into(), false, cx)
-        }),
-        crate::ThreadEvent::AgentThinking(text) => thread.update(cx, |thread, cx| {
-            thread.push_assistant_content_block(text.into(), true, cx)
-        }),
-        crate::ThreadEvent::Retry(status) => {
-            thread.update(cx, |thread, cx| thread.update_retry_status(status, cx))
-        }
-        crate::ThreadEvent::ContextCompaction(compaction) => thread.update(cx, |thread, cx| {
-            thread.push_context_compaction(compaction, cx)
-        }),
-        crate::ThreadEvent::ContextCompactionUpdate(update) => thread.update(cx, |thread, cx| {
-            thread.update_context_compaction(update, cx)
-        }),
-        crate::ThreadEvent::UserMessage(_) | crate::ThreadEvent::Stop(_) => {}
-    }
-    Ok(())
 }
