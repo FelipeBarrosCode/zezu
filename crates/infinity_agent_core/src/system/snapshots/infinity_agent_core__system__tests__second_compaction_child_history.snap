@@ -1,0 +1,84 @@
+---
+source: crates/infinity-agent-core/src/system/tests.rs
+expression: compaction_child_req.chat_history
+---
+[
+  {
+    "role": "assistant",
+    "content": [
+      {
+        "text": "[Compacted conversation summary]\nSummary of first round"
+      }
+    ]
+  },
+  {
+    "role": "user",
+    "content": [
+      {
+        "type": "text",
+        "text": "second message"
+      }
+    ]
+  },
+  {
+    "role": "assistant",
+    "content": [
+      {
+        "text": "second response"
+      }
+    ]
+  },
+  {
+    "role": "user",
+    "content": [
+      {
+        "type": "text",
+        "text": "third message"
+      }
+    ]
+  },
+  {
+    "role": "assistant",
+    "content": [
+      {
+        "text": "third response"
+      }
+    ]
+  },
+  {
+    "role": "user",
+    "content": [
+      {
+        "type": "text",
+        "text": "fourth message"
+      }
+    ]
+  },
+  {
+    "role": "assistant",
+    "content": [
+      {
+        "id": "[id]",
+        "function": {
+          "name": "__harness_begin_compaction__",
+          "arguments": {}
+        }
+      }
+    ]
+  },
+  {
+    "role": "user",
+    "content": [
+      {
+        "type": "toolresult",
+        "id": "[id]",
+        "content": [
+          {
+            "type": "text",
+            "text": "[compaction_instructions]"
+          }
+        ]
+      }
+    ]
+  }
+]

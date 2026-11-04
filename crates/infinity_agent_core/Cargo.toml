@@ -1,0 +1,35 @@
+[package]
+name = "infinity-agent-core"
+version = "0.2.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/hydro-project/infinity"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+rap-client = { git = "https://github.com/hydro-project/infinity", rev = "1abc6fcff1f186124f924b56aa92c3a3684c90c5" }
+rap-protocol = { git = "https://github.com/hydro-project/infinity", rev = "1abc6fcff1f186124f924b56aa92c3a3684c90c5" }
+infinity-provider-protocol = { path = "../infinity_provider_protocol" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
+tokio-util = "0.7"
+futures-util = "0.3"
+async-trait = "0.1"
+async-stream = "0.3"
+chrono = "0.4"
+chrono-tz = "0.10"
+uuid = { version = "1", features = ["v4"] }
+url = "2"
+tracing = "0.1"
+rhai = { version = "1", features = ["no_optimize"] }
+
+[dev-dependencies]
+insta = { version = "1", features = ["json", "redactions"] }
+libc = "0.2"
+infinity-provider-protocol = { path = "../infinity_provider_protocol", features = ["mock"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "test-util"] }
+futures-util = { version = "0.3", features = ["sink"] }

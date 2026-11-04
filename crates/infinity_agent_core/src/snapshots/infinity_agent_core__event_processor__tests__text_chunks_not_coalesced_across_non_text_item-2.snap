@@ -1,0 +1,28 @@
+---
+source: crates/infinity-agent-core/src/event_processor.rs
+expression: hm.history.borrow().clone()
+---
+[
+  {
+    "kind": "assistant",
+    "content": {
+      "text": "before"
+    }
+  },
+  {
+    "kind": "tool_call",
+    "call": {
+      "id": "tc-1",
+      "function": {
+        "name": "some_tool",
+        "arguments": {}
+      }
+    }
+  },
+  {
+    "kind": "assistant",
+    "content": {
+      "text": "after"
+    }
+  }
+]

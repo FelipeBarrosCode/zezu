@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/infinity_agent_core",
+    "crates/infinity_provider_protocol",
     "crates/acp_thread",
     "crates/acp_tools",
     "crates/action_log",
@@ -1214,3 +1216,7 @@ nonminimal_bool = "allow"
 # this workspace on purpose.
 [workspace.metadata.dylint]
 libraries = [{ path = "tooling/lints" }]
+
+[patch."https://github.com/hydro-project/infinity"]
+infinity-provider-protocol = { path = "crates/infinity_provider_protocol" }
+infinity-agent-core = { path = "crates/infinity_agent_core" }

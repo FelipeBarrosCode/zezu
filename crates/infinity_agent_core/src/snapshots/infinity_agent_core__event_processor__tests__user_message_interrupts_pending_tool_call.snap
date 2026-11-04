@@ -1,0 +1,44 @@
+---
+source: crates/infinity-agent-core/src/event_processor.rs
+expression: hm.history.into_inner()
+---
+[
+  {
+    "kind": "user",
+    "content": {
+      "type": "text",
+      "text": "do something"
+    }
+  },
+  {
+    "kind": "tool_call",
+    "call": {
+      "id": "tc-1",
+      "function": {
+        "name": "some_tool",
+        "arguments": {
+          "x": 1
+        }
+      }
+    }
+  },
+  {
+    "kind": "tool_result",
+    "result": {
+      "id": "tc-1",
+      "content": [
+        {
+          "type": "text",
+          "text": "Tool call interrupted by user"
+        }
+      ]
+    }
+  },
+  {
+    "kind": "user",
+    "content": {
+      "type": "text",
+      "text": "actually, never mind"
+    }
+  }
+]

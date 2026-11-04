@@ -68,6 +68,7 @@ impl std::error::Error for StoreError {
 
 #[derive(Clone)]
 pub struct SqliteInfinityStore {
+    history_budget: Option<crate::history_budget::HistoryBudget>,
     store: RuntimeStore,
     origin: Option<Lease>,
     response_complete: Option<Arc<AtomicBool>>,
@@ -81,6 +82,7 @@ impl SqliteInfinityStore {
             store,
             origin: None,
             response_complete: None,
+            history_budget: None,
             tool_names: Arc::default(),
             runtime_model_id: None,
         }
@@ -154,12 +156,37 @@ impl ConversationStore for SqliteInfinityStore {
         end: Option<i64>,
     ) -> Result<Vec<InfinityMessage>, Self::Error> {
         let id = thread.as_str().to_owned();
-        self.store.read(move |connection| {
-            ensure!(start.unwrap_or(0) >= 0 && end.unwrap_or(i64::MAX) >= 0, "negative history boundary");
-            let mut statement = connection.prepare("SELECT payload FROM history WHERE agent_id=? AND position>=? AND position<? ORDER BY position")?;
-            let payloads = statement.query_map(params![id,start.unwrap_or(0),end.unwrap_or(i64::MAX)], |row| row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-            payloads.into_iter().map(|payload| Ok(serde_json::from_str(&payload)?)).collect()
-        }).await.map_err(Into::into)
+        let budget =
+            self.history_budget
+                .clone()
+                .unwrap_or(crate::history_budget::HistoryBudget::new(
+                    crate::history_budget::DEFAULT_HISTORY_BYTES,
+                )?);
+        self.store
+            .read(move |connection| {
+                crate::history_budget::load_bounded_history(connection, &id, start, end, &budget)
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn load_history_with_ancestors(
+        &self,
+        thread: &ThreadId<str>,
+    ) -> Result<(Vec<InfinityMessage>, Option<i64>, usize), Self::Error> {
+        let id = thread.as_str().to_owned();
+        let budget =
+            self.history_budget
+                .clone()
+                .unwrap_or(crate::history_budget::HistoryBudget::new(
+                    crate::history_budget::DEFAULT_HISTORY_BYTES,
+                )?);
+        self.store
+            .read(move |connection| {
+                crate::compaction::load_effective_history(connection, &id, &budget)
+            })
+            .await
+            .map_err(Into::into)
     }
 
     async fn append_messages(
@@ -177,20 +204,28 @@ impl ConversationStore for SqliteInfinityStore {
             if let Some(complete) = complete { ensure!(complete.load(Ordering::Acquire), "incomplete model output cannot be checkpointed"); }
             let transaction = connection.transaction()?;
             let mut position: i64 = transaction.query_row("SELECT coalesce(max(position)+1,0) FROM history WHERE agent_id=?", [&id], |row| row.get(0))?;
+            let runtime_profile_id=origin.as_ref().map(|origin|runtime_profile_id(&transaction,origin)).transpose()?.flatten();
             for (message, message_id) in messages {
-                let payload = serde_json::to_string(&message)?;
+                let mut serialized=serde_json::to_value(&message)?;
+                if let (Some(origin),InfinityMessage::ToolCall {call,..})=(&origin,&message) {
+                    serialized.as_object_mut().ok_or_else(||anyhow::anyhow!("tool call must serialize as object"))?.insert("runtime_job_id".into(),serde_json::json!(format!("{}:{}:{}",id,origin.generation,call.id)));
+                }
+                let payload = serde_json::to_string(&serialized)?;
                 ensure!(payload.len() <= maximum_bytes, "history item exceeds byte limit");
                 let existing: Option<String> = transaction.query_row("SELECT payload FROM history WHERE agent_id=? AND message_id=?", params![id,message_id], |row| row.get(0)).optional()?;
                 if let Some(existing) = existing { ensure!(existing == payload, "history dedup ID reused with different content"); }
                 else {
                     transaction.execute("INSERT INTO history(agent_id,position,message_id,payload) VALUES (?,?,?,?)", params![id,position,message_id,payload])?;
                     position += 1;
+                    if let Some(context)=crate::model::compacted_context_from_message(&message)? {
+                        crate::compaction::record_context(&transaction,&id,position,&context)?;
+                    }
                 }
                 if let (Some(origin), InfinityMessage::ToolCall {call,..}) = (&origin, &message)
                     && tool_names.contains(&call.function.name)
                 {
                     let job_id = format!("{}:{}:{}",id,origin.generation,call.id);
-                    let intent = serde_json::to_string(&serde_json::json!({"tool":call.function.name,"arguments":call.function.arguments,"tool_call_id":call.id,"provider_call_id":call.call_id,"runtime_root_id":origin.root_id,"runtime_model_id":runtime_model_id}))?;
+                    let intent = serde_json::to_string(&serde_json::json!({"tool":call.function.name,"arguments":call.function.arguments,"tool_call_id":call.id,"provider_call_id":call.call_id,"runtime_root_id":origin.root_id,"runtime_model_id":runtime_model_id,"runtime_profile_id":runtime_profile_id}))?;
                     transaction.execute("INSERT OR IGNORE INTO jobs(id,agent_id,generation,state,payload) VALUES (?,?,?,'queued',?)",params![job_id,id,origin.generation,intent])?;
                 }
                 // Infinity currently writes these IDs in a separate call and ignores its
@@ -578,10 +613,17 @@ struct CompletedResponseProvider {
     provider: Arc<dyn ModelProvider>,
     complete: Arc<AtomicBool>,
     failure: Arc<OnceLock<String>>,
+    maximum_tool_calls: usize,
 }
 
 #[async_trait]
 impl ModelProvider for CompletedResponseProvider {
+    fn supports_parallel_tool_calls(&self) -> bool {
+        self.provider.supports_parallel_tool_calls()
+    }
+    fn preserves_unsigned_reasoning(&self) -> bool {
+        self.provider.preserves_unsigned_reasoning()
+    }
     async fn list_models(
         &self,
     ) -> Result<Vec<ModelEntry>, Box<dyn std::error::Error + Send + Sync>> {
@@ -607,14 +649,24 @@ impl ModelProvider for CompletedResponseProvider {
             })?;
         let complete = self.complete.clone();
         let failure = self.failure.clone();
+        let maximum_tool_calls = self.maximum_tool_calls;
         Ok(futures::stream::unfold(
-            (stream, false, complete, failure),
-            |(mut stream, ended, complete, failure)| async move {
+            (stream, false, complete, failure, 0usize),
+            move |(mut stream, ended, complete, failure, mut tool_calls)| async move {
                 if ended {
                     return None;
                 }
                 let chunk = stream.next().await;
                 let (chunk, ended) = match chunk {
+                    Some(Ok(StreamChunk::ToolCall(call)))=> {
+                        tool_calls=tool_calls.saturating_add(1);
+                        if tool_calls>maximum_tool_calls {
+                            complete.store(false,Ordering::Release);
+                            let message=format!("model response exceeds the {maximum_tool_calls}-tool-call limit for one input slice; request a smaller tool batch");
+                            failure.get_or_init(||message.clone());
+                            (Err(CompletionError::provider(infinity_provider_protocol::ErrorClass::Fatal,message)),true)
+                        } else {(Ok(StreamChunk::ToolCall(call)),false)}
+                    }
                     Some(Ok(StreamChunk::Final(response))) => {
                         complete.store(true, Ordering::Release);
                         (Ok(StreamChunk::Final(response)), false)
@@ -644,7 +696,7 @@ impl ModelProvider for CompletedResponseProvider {
                     }
                     None => return None,
                 };
-                Some((chunk, (stream, ended, complete, failure)))
+                Some((chunk, (stream, ended, complete, failure, tool_calls)))
             },
         )
         .boxed())
@@ -656,6 +708,60 @@ struct QueuedTool {
     store: RuntimeStore,
     lease: Lease,
     runtime_model_id: String,
+}
+
+fn runtime_profile_id(connection: &Connection, origin: &Lease) -> Result<Option<String>> {
+    for agent in [&origin.agent_id, &origin.root_id] {
+        let metadata: Option<String> =
+            connection.query_row("SELECT metadata FROM agents WHERE id=?", [agent], |row| {
+                row.get(0)
+            })?;
+        if let Some(metadata) = metadata {
+            let metadata: Value = serde_json::from_str(&metadata)?;
+            match metadata.get("profile") {
+                Some(Value::String(profile)) => return Ok(Some(profile.clone())),
+                None | Some(Value::Null) => {}
+                _ => anyhow::bail!("runtime profile must be a string identifier"),
+            }
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+
+    #[test]
+    fn restrictive_child_profile_is_authoritative_over_parent_write_profile() -> Result<()> {
+        let connection = Connection::open_in_memory()?;
+        connection.execute_batch("CREATE TABLE agents(id TEXT PRIMARY KEY,metadata TEXT); INSERT INTO agents VALUES ('root','{\"profile\":\"write\"}'),('child','{\"profile\":\"ask\"}');")?;
+        let lease = Lease {
+            agent_id: "child".into(),
+            root_id: "root".into(),
+            generation: 1,
+            id: "lease".into(),
+            inputs: Vec::new(),
+        };
+        assert_eq!(runtime_profile_id(&connection, &lease)?, Some("ask".into()));
+        connection.execute(
+            "UPDATE agents SET metadata='{\"profile\":null}' WHERE id='child'",
+            [],
+        )?;
+        assert_eq!(
+            runtime_profile_id(&connection, &lease)?,
+            Some("write".into())
+        );
+        connection.execute(
+            "UPDATE agents SET metadata='{\"profile\":{\"invalid\":true}}' WHERE id='child'",
+            [],
+        )?;
+        assert!(
+            runtime_profile_id(&connection, &lease).is_err(),
+            "malformed child profile must not fall back to broader parent permissions"
+        );
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -683,7 +789,11 @@ impl Tool<SqliteInfinityStore> for QueuedTool {
             self.lease.generation,
             id.as_str()
         );
-        self.store.record_job(self.lease.clone(),job_id,serde_json::json!({"tool":self.definition.name,"arguments":args,"tool_call_id":id.as_str(),"provider_call_id":call_id.map(|id| id.into_inner()),"runtime_root_id":self.lease.root_id,"runtime_model_id":self.runtime_model_id})).await?;
+        let recorded = self.store.job(job_id.clone()).await?;
+        let runtime_profile_id = recorded.payload.get("runtime_profile_id").ok_or_else(|| {
+            anyhow::anyhow!("legacy tool intent requires explicit profile reconciliation")
+        })?;
+        self.store.record_job(self.lease.clone(),job_id,serde_json::json!({"tool":self.definition.name,"arguments":args,"tool_call_id":id.as_str(),"provider_call_id":call_id.map(|id| id.into_inner()),"runtime_root_id":self.lease.root_id,"runtime_model_id":self.runtime_model_id,"runtime_profile_id":runtime_profile_id})).await?;
         Ok(())
     }
 }
@@ -708,11 +818,15 @@ impl InfinitySlice {
             provider: self.provider.clone(),
             complete: complete.clone(),
             failure: failure.clone(),
+            maximum_tool_calls: store.limits().max_inputs_per_slice.min(256),
         });
         let backend = SqliteInfinityStore {
             store: store.clone(),
             origin: Some(lease.clone()),
             response_complete: Some(complete.clone()),
+            history_budget: Some(crate::history_budget::HistoryBudget::new(
+                crate::history_budget::DEFAULT_HISTORY_BYTES,
+            )?),
             tool_names: Arc::new(self.tools.iter().map(|tool| tool.name.clone()).collect()),
             runtime_model_id: Some(self.model.model_id.clone()),
         };

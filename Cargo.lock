@@ -8879,7 +8879,6 @@ checksum = "f4c7245a08504955605670dbf141fceab975f15ca21570696aebe9d2e71576bd"
 [[package]]
 name = "infinity-agent-core"
 version = "0.2.0"
-source = "git+https://github.com/hydro-project/infinity?rev=1abc6fcff1f186124f924b56aa92c3a3684c90c5#1abc6fcff1f186124f924b56aa92c3a3684c90c5"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -8887,6 +8886,8 @@ dependencies = [
  "chrono-tz",
  "futures-util",
  "infinity-provider-protocol",
+ "insta",
+ "libc",
  "rap-client",
  "rap-protocol",
  "rhai",
@@ -8902,13 +8903,18 @@ dependencies = [
 [[package]]
 name = "infinity-provider-protocol"
 version = "0.2.0"
-source = "git+https://github.com/hydro-project/infinity?rev=1abc6fcff1f186124f924b56aa92c3a3684c90c5#1abc6fcff1f186124f924b56aa92c3a3684c90c5"
 dependencies = [
+ "async-stream",
  "async-trait",
  "futures-util",
+ "infinity-provider-protocol",
  "serde",
  "serde_json",
  "thiserror 2.0.17",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -8989,6 +8995,21 @@ dependencies = [
  "util",
  "workspace",
  "zed_actions",
+]
+
+[[package]]
+name = "insta"
+version = "1.49.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b67d3d2e287e4b86c10b3f3b641033d1f89b74bdb39d05f34952e2b9a6fe21cd"
+dependencies = [
+ "console",
+ "once_cell",
+ "pest",
+ "pest_derive",
+ "serde",
+ "similar",
+ "tempfile",
 ]
 
 [[package]]

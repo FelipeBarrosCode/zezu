@@ -533,9 +533,7 @@ mod tests {
         provider.send_event(
             &model,
             &request,
-            LanguageModelCompletionEvent::ReasoningDetails(
-                serde_json::json!({"id": "provider-specific"}),
-            ),
+            LanguageModelCompletionEvent::Stop(StopReason::MaxTokens),
         );
         let notice = next_notice(&mut notices).await;
         assert_eq!(notice.agent_id, id);
@@ -543,7 +541,7 @@ mod tests {
             notice
                 .error
                 .as_deref()
-                .is_some_and(|error| error.contains("protocol extension")),
+                .is_some_and(|error| error.contains("MaxTokens")),
             "{:?}",
             notice.error
         );
