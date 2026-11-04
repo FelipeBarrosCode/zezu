@@ -77,6 +77,20 @@ pub struct EditFileTool {
 }
 
 impl EditFileTool {
+    pub fn new_runtime(
+        project: Entity<Project>,
+        action_log: Entity<ActionLog>,
+        language_registry: Arc<LanguageRegistry>,
+    ) -> Self {
+        Self {
+            session_context: Arc::new(EditSessionContext::new_runtime(
+                project,
+                action_log,
+                language_registry,
+            )),
+        }
+    }
+
     pub fn new(
         project: Entity<Project>,
         thread: WeakEntity<Thread>,

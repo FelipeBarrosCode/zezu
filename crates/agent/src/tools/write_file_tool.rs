@@ -66,6 +66,20 @@ pub struct WriteFileTool {
 }
 
 impl WriteFileTool {
+    pub fn new_runtime(
+        project: Entity<Project>,
+        action_log: Entity<ActionLog>,
+        language_registry: Arc<LanguageRegistry>,
+    ) -> Self {
+        Self {
+            session_context: Arc::new(EditSessionContext::new_runtime(
+                project,
+                action_log,
+                language_registry,
+            )),
+        }
+    }
+
     pub fn new(
         project: Entity<Project>,
         thread: WeakEntity<Thread>,
@@ -282,6 +296,38 @@ mod tests {
     use std::{path::PathBuf, sync::Arc};
     use util::path;
     use util::rel_path::{RelPath, rel_path};
+
+    #[gpui::test]
+    async fn runtime_write_preserves_native_edit_pipeline_without_a_thread(
+        cx: &mut TestAppContext,
+    ) {
+        let (legacy_tool, project, action_log, fs, thread) =
+            setup_test(cx, json!({"file.txt": "old content"})).await;
+        let languages = project.read_with(cx, |project, _| project.languages().clone());
+        let tool = Arc::new(WriteFileTool::new_runtime(project, action_log, languages));
+        drop(legacy_tool);
+        drop(thread);
+        let result = cx
+            .update(|cx| {
+                tool.run(
+                    ToolInput::resolved(WriteFileToolInput {
+                        path: "root/file.txt".into(),
+                        content: "native runtime edit".into(),
+                    }),
+                    ToolCallEventStream::test().0,
+                    cx,
+                )
+            })
+            .await
+            .expect("native write");
+        assert!(matches!(result, EditSessionOutput::Success { .. }));
+        assert_eq!(
+            fs.load(path!("/root/file.txt").as_ref())
+                .await
+                .expect("saved file"),
+            "native runtime edit"
+        );
+    }
 
     #[gpui::test]
     async fn test_streaming_write_create_file(cx: &mut TestAppContext) {

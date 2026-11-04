@@ -137,6 +137,9 @@ impl RuntimeStore {
             version == 1,
             "unsupported runtime database version: {version}"
         );
+        crate::jobs::initialize_connection(&connection)?;
+        crate::input_batches::initialize(&connection)?;
+        crate::projection::initialize(&connection)?;
         recover(&mut connection)?;
         let mut readers = Vec::new();
         for _ in 0..2 {
@@ -333,10 +336,14 @@ impl RuntimeStore {
             let transaction = connection.transaction()?;
             let active: usize = transaction.query_row("SELECT count(*) FROM agents WHERE state='running'", [], |row| row.get(0))?;
             if active >= maximum_active { return Ok(None); }
+            // AdmissionCursor caches empty results. Changes to these eligibility
+            // dependencies must advance the clock initialized by admission/jobs.
             let next: Option<(String,String,i64)> = transaction.query_row(
                 "SELECT agents.id,root_id,generation FROM agents JOIN runs ON root_id=runs.id
                  WHERE state='queued' AND closed=0 AND pause_requested=0
+
                  AND NOT EXISTS(SELECT 1 FROM jobs WHERE jobs.agent_id=agents.id AND jobs.state='uncertain')
+                 AND NOT EXISTS(SELECT 1 FROM jobs WHERE jobs.agent_id=agents.id AND jobs.generation=agents.generation AND jobs.state IN ('queued','dispatched'))
                  AND EXISTS(SELECT 1 FROM inbox WHERE agent_id=agents.id AND processed=0)
                  ORDER BY runs.last_admitted,agents.last_admitted,agents.id LIMIT 1",
                 [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
@@ -346,10 +353,11 @@ impl RuntimeStore {
             let clock: i64 = transaction.query_row("SELECT coalesce(max(last_admitted),0)+1 FROM runs", [], |row| row.get(0))?;
             transaction.execute("UPDATE runs SET last_admitted=? WHERE id=?", params![clock,root_id])?;
             transaction.execute("UPDATE agents SET state='running',lease_id=?,last_admitted=? WHERE id=?", params![lease_id,clock,agent_id])?;
-            let inputs: Vec<(String, String)> = {
+            let mut inputs: Vec<(String, String)> = {
                 let mut statement = transaction.prepare("SELECT message_id,payload FROM inbox WHERE agent_id=? AND processed=0 ORDER BY sequence LIMIT ?")?;
                 statement.query_map(params![agent_id,input_limit], |row| Ok((row.get(0)?,row.get(1)?)))?.collect::<rusqlite::Result<_>>()?
             };
+            crate::input_batches::preserve_boundary(&transaction, &agent_id, &mut inputs)?;
             for (message_id, _) in &inputs {
                 transaction.execute("UPDATE inbox SET lease_id=? WHERE agent_id=? AND message_id=?", params![lease_id,agent_id,message_id])?;
             }
@@ -369,6 +377,7 @@ impl RuntimeStore {
         self.write(move |connection| {
             let transaction = connection.transaction()?;
             check_lease(&transaction, &lease)?;
+            transaction.execute("DELETE FROM runtime_errors WHERE agent_id=?", [&lease.agent_id])?;
             transaction.execute("UPDATE inbox SET processed=1,lease_id=NULL WHERE agent_id=? AND lease_id=?", params![lease.agent_id,lease.id])?;
             let pending: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM inbox WHERE agent_id=? AND processed=0)", [&lease.agent_id], |row| row.get(0))?;
             let state = match outcome {
@@ -418,7 +427,8 @@ impl RuntimeStore {
             transaction.execute("UPDATE jobs SET generation=(SELECT generation FROM agents WHERE agents.id=jobs.agent_id) WHERE state='queued' AND agent_id IN (SELECT id FROM agents WHERE root_id=(SELECT root_id FROM agents WHERE id=?) AND pause_requested=0)", [&agent_id])?;
             transaction.commit()?;
             Ok(())
-        }).await
+        }).await?;
+        Ok(())
     }
 
     pub async fn cancel(&self, agent_id: String) -> Result<()> {
@@ -429,7 +439,9 @@ impl RuntimeStore {
                  UPDATE agents SET state='cancelled',generation=generation+1,lease_id=NULL,pause_requested=0
                  WHERE id IN (SELECT id FROM scope) AND state NOT IN ('completed','failed','cancelled')", [&agent_id],
             )?;
-            transaction.execute("UPDATE inbox SET processed=1,lease_id=NULL WHERE agent_id IN (SELECT id FROM agents WHERE state='cancelled')", [])?;
+            // Discard cancelled prompts, but retain canonical completed tool results
+            // for a later explicit user turn, including an unknown-outcome acknowledgement.
+            transaction.execute("UPDATE inbox SET processed=CASE WHEN EXISTS(SELECT 1 FROM jobs WHERE jobs.agent_id=inbox.agent_id AND jobs.state='completed' AND jobs.result=inbox.payload) THEN processed ELSE 1 END,lease_id=NULL WHERE agent_id IN (SELECT id FROM agents WHERE state='cancelled')", [])?;
             transaction.execute("UPDATE jobs SET state=CASE WHEN state='dispatched' THEN 'uncertain' ELSE 'cancelled' END WHERE state IN ('queued','dispatched') AND agent_id IN (SELECT id FROM agents WHERE state='cancelled')", [])?;
             transaction.commit()?;
             Ok(())
@@ -485,7 +497,7 @@ impl RuntimeStore {
     pub async fn dispatch_job(&self, id: String) -> Result<Job> {
         self.write(move |connection| {
             let transaction = connection.transaction()?;
-            let changed = transaction.execute("UPDATE jobs SET state='dispatched' WHERE id=? AND state='queued' AND EXISTS(SELECT 1 FROM agents WHERE agents.id=jobs.agent_id AND agents.generation=jobs.generation AND pause_requested=0 AND state IN ('queued','running','waiting'))", [&id])?;
+            let changed = transaction.execute("UPDATE jobs SET state='dispatched' WHERE id=? AND state='queued' AND EXISTS(SELECT 1 FROM agents WHERE agents.id=jobs.agent_id AND agents.generation=jobs.generation AND pause_requested=0  AND state IN ('queued','running','waiting'))", [&id])?;
             ensure!(changed == 1, "job cannot be dispatched in its current state");
             let job = load_job(&transaction, &id)?;
             transaction.commit()?;
@@ -622,6 +634,7 @@ fn writer_loop(mut connection: Connection, owner: File, mut receiver: mpsc::Rece
         log::error!("runtime shutdown checkpoint failed: {error:#}");
     }
     drop(connection);
+    let result = result.and(owner.unlock().map_err(Into::into));
     drop(owner);
     if let Some(reply) = shutdown_reply {
         if let Err(Err(error)) = reply.send(result) {
@@ -726,7 +739,7 @@ pub(crate) fn spawn_child(
     Ok(id)
 }
 
-fn enqueue(
+pub(crate) fn enqueue(
     connection: &Connection,
     agent_id: &str,
     message_id: &str,
@@ -767,6 +780,12 @@ fn enqueue(
         params![agent_id, message_id, payload],
     )? == 1;
     if inserted {
+        if user && matches!(state.as_str(), "completed" | "failed" | "cancelled") {
+            connection.execute(
+                "UPDATE agents SET generation=generation+1 WHERE id=?",
+                [agent_id],
+            )?;
+        }
         connection.execute("UPDATE agents SET state='queued' WHERE id=? AND state!='running' AND (state!='paused' OR ?)", params![agent_id,user])?;
         if user {
             connection.execute("UPDATE agents SET pause_requested=0 WHERE id=?", [agent_id])?;

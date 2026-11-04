@@ -338,7 +338,7 @@ impl UserMessage {
         markdown
     }
 
-    fn to_request(&self) -> LanguageModelRequestMessage {
+    pub(crate) fn to_request(&self) -> LanguageModelRequestMessage {
         let mut message = LanguageModelRequestMessage {
             role: Role::User,
             content: Vec::with_capacity(self.content.len()),
@@ -2337,7 +2337,7 @@ impl Thread {
     ///
     /// Returns the (possibly downgraded) profile and whether a downgrade
     /// happened.
-    fn profile_for_restricted_workspace(
+    pub(crate) fn profile_for_restricted_workspace(
         profile_id: AgentProfileId,
         project: &Entity<Project>,
         cx: &App,
@@ -4956,7 +4956,7 @@ fn total_input_tokens(usage: language_model::TokenUsage) -> u64 {
 }
 
 /// Reserves output without subtracting it from an independent input ceiling.
-fn compaction_input_capacity(
+pub(crate) fn compaction_input_capacity(
     input_limit: u64,
     combined_limit: Option<u64>,
     output_limit: Option<u64>,
@@ -4966,7 +4966,7 @@ fn compaction_input_capacity(
     })
 }
 
-fn auto_compact_threshold_token_count(
+pub(crate) fn auto_compact_threshold_token_count(
     threshold: AutoCompactThreshold,
     max_token_count: u64,
 ) -> u64 {
@@ -5906,6 +5906,28 @@ pub struct ToolCallEventStream {
 }
 
 impl ToolCallEventStream {
+    pub(crate) fn for_runtime(
+        tool_use_id: LanguageModelToolUseId,
+        job_id: String,
+        fs: Arc<dyn Fs>,
+        cancellation_rx: watch::Receiver<bool>,
+        sandbox_grants: Rc<RefCell<ThreadSandboxGrants>>,
+    ) -> (Self, mpsc::UnboundedReceiver<Result<ThreadEvent>>) {
+        let (sender, receiver) = mpsc::unbounded();
+        (
+            Self::new(
+                tool_use_id,
+                acp_v2::ToolCallId::new(job_id),
+                ThreadEventStream::new(sender),
+                Some(fs),
+                cancellation_rx,
+                sandbox_grants,
+                None,
+            ),
+            receiver,
+        )
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn test() -> (Self, ToolCallEventStreamReceiver) {
         let (stream, receiver, _cancellation_tx) = Self::test_with_cancellation();

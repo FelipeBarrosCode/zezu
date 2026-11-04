@@ -1,11 +1,16 @@
 mod infinity;
+mod input_batches;
+mod jobs;
 pub mod model;
+pub mod projection;
+pub mod resource;
 mod runtime;
 mod store;
 #[cfg(test)]
 mod tests;
 
 pub use infinity::{InfinitySlice, SqliteInfinityStore};
+pub use projection::{FleetSummary, HistoryReference, TranscriptEntry, TranscriptPage};
 pub use runtime::{EmbeddedRuntime, RuntimeNotice, RuntimeNoticeReceiver, SliceFactory};
 pub use store::{
     AgentPage, AgentSnapshot, Job, JobRecovery, JobState, Lease, RuntimeStore, SliceOutcome,
@@ -52,3 +57,5 @@ impl RuntimeLimits {
         Ok(())
     }
 }
+
+pub use jobs::{JobDispatchCursor, UncertainJob};

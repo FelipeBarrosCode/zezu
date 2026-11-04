@@ -39,6 +39,8 @@ feature_flags.workspace = true
 fs.workspace = true
 futures.workspace = true
 futures-lite.workspace = true
+infinity-agent-core = { git = "https://github.com/hydro-project/infinity", rev = "1abc6fcff1f186124f924b56aa92c3a3684c90c5" }
+infinity-provider-protocol = { git = "https://github.com/hydro-project/infinity", rev = "1abc6fcff1f186124f924b56aa92c3a3684c90c5" }
 git.workspace = true
 gpui.workspace = true
 handlebars = { workspace = true, features = ["rust-embed"] }
@@ -72,6 +74,7 @@ task.workspace = true
 telemetry.workspace = true
 tempfile.workspace = true
 text.workspace = true
+tokio.workspace = true
 thiserror.workspace = true
 ui.workspace = true
 url.workspace = true

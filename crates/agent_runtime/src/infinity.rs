@@ -72,6 +72,7 @@ pub struct SqliteInfinityStore {
     origin: Option<Lease>,
     response_complete: Option<Arc<AtomicBool>>,
     tool_names: Arc<HashSet<String>>,
+    runtime_model_id: Option<String>,
 }
 
 impl SqliteInfinityStore {
@@ -81,6 +82,7 @@ impl SqliteInfinityStore {
             origin: None,
             response_complete: None,
             tool_names: Arc::default(),
+            runtime_model_id: None,
         }
     }
 
@@ -169,6 +171,7 @@ impl ConversationStore for SqliteInfinityStore {
         let complete = self.response_complete.clone();
         let origin = self.origin.clone();
         let tool_names = self.tool_names.clone();
+        let runtime_model_id = self.runtime_model_id.clone();
         let maximum_bytes = self.store.limits().max_input_bytes;
         self.mutate(move |connection| {
             if let Some(complete) = complete { ensure!(complete.load(Ordering::Acquire), "incomplete model output cannot be checkpointed"); }
@@ -187,7 +190,7 @@ impl ConversationStore for SqliteInfinityStore {
                     && tool_names.contains(&call.function.name)
                 {
                     let job_id = format!("{}:{}:{}",id,origin.generation,call.id);
-                    let intent = serde_json::to_string(&serde_json::json!({"tool":call.function.name,"arguments":call.function.arguments,"tool_call_id":call.id,"provider_call_id":call.call_id}))?;
+                    let intent = serde_json::to_string(&serde_json::json!({"tool":call.function.name,"arguments":call.function.arguments,"tool_call_id":call.id,"provider_call_id":call.call_id,"runtime_root_id":origin.root_id,"runtime_model_id":runtime_model_id}))?;
                     transaction.execute("INSERT OR IGNORE INTO jobs(id,agent_id,generation,state,payload) VALUES (?,?,?,'queued',?)",params![job_id,id,origin.generation,intent])?;
                 }
                 // Infinity currently writes these IDs in a separate call and ignores its
@@ -652,6 +655,7 @@ struct QueuedTool {
     definition: ToolDefinition,
     store: RuntimeStore,
     lease: Lease,
+    runtime_model_id: String,
 }
 
 #[async_trait]
@@ -679,7 +683,7 @@ impl Tool<SqliteInfinityStore> for QueuedTool {
             self.lease.generation,
             id.as_str()
         );
-        self.store.record_job(self.lease.clone(),job_id,serde_json::json!({"tool":self.definition.name,"arguments":args,"tool_call_id":id.as_str(),"provider_call_id":call_id.map(|id| id.into_inner())})).await?;
+        self.store.record_job(self.lease.clone(),job_id,serde_json::json!({"tool":self.definition.name,"arguments":args,"tool_call_id":id.as_str(),"provider_call_id":call_id.map(|id| id.into_inner()),"runtime_root_id":self.lease.root_id,"runtime_model_id":self.runtime_model_id})).await?;
         Ok(())
     }
 }
@@ -710,6 +714,7 @@ impl InfinitySlice {
             origin: Some(lease.clone()),
             response_complete: Some(complete.clone()),
             tool_names: Arc::new(self.tools.iter().map(|tool| tool.name.clone()).collect()),
+            runtime_model_id: Some(self.model.model_id.clone()),
         };
         let tools = self
             .tools
@@ -720,6 +725,7 @@ impl InfinitySlice {
                     definition,
                     store: store.clone(),
                     lease: lease.clone(),
+                    runtime_model_id: self.model.model_id.clone(),
                 }) as Box<dyn Tool<SqliteInfinityStore>>
             })
             .collect::<Vec<_>>();

@@ -135,7 +135,7 @@ impl From<EditSessionOutput> for LanguageModelToolResultContent {
 
 pub(crate) struct EditSessionContext {
     project: Entity<Project>,
-    thread: WeakEntity<Thread>,
+    thread: Option<WeakEntity<Thread>>,
     action_log: Entity<ActionLog>,
     language_registry: Arc<LanguageRegistry>,
 }
@@ -149,7 +149,20 @@ impl EditSessionContext {
     ) -> Self {
         Self {
             project,
-            thread,
+            thread: Some(thread),
+            action_log,
+            language_registry,
+        }
+    }
+
+    pub(crate) fn new_runtime(
+        project: Entity<Project>,
+        action_log: Entity<ActionLog>,
+        language_registry: Arc<LanguageRegistry>,
+    ) -> Self {
+        Self {
+            project,
+            thread: None,
             action_log,
             language_registry,
         }
@@ -162,19 +175,29 @@ impl EditSessionContext {
         event_stream: &ToolCallEventStream,
         cx: &mut App,
     ) -> Task<Result<()>> {
-        super::tool_permissions::authorize_file_edit(
-            tool_name,
-            path,
-            &self.thread,
-            event_stream,
-            cx,
-        )
+        match &self.thread {
+            Some(thread) => super::tool_permissions::authorize_file_edit(
+                tool_name,
+                path,
+                thread,
+                event_stream,
+                cx,
+            ),
+            None => super::tool_permissions::authorize_project_file_edit(
+                tool_name,
+                path,
+                self.project.clone(),
+                event_stream,
+                cx,
+            ),
+        }
     }
 
     fn set_agent_location(&self, buffer: WeakEntity<Buffer>, position: text::Anchor, cx: &mut App) {
         let should_update_agent_location = self
             .thread
-            .read_with(cx, |thread, _cx| !thread.is_subagent())
+            .as_ref()
+            .and_then(|thread| thread.read_with(cx, |thread, _| !thread.is_subagent()).ok())
             .unwrap_or_default();
         if should_update_agent_location {
             self.project.update(cx, |project, cx| {
