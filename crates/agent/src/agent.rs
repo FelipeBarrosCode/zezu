@@ -10,6 +10,7 @@ pub use runtime_tools::{
 };
 pub mod outline;
 mod pattern_extraction;
+pub mod runtime_context;
 mod sandboxing;
 mod templates;
 #[cfg(test)]
