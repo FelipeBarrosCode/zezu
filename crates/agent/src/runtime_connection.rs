@@ -634,8 +634,19 @@ impl NativeRuntimeConnection {
                         Ok(true) => {}
                         Ok(false) => break,
                         Err(error) => {
-                            log::debug!("runtime projection stopped: {error:#}");
-                            break;
+                            if view.upgrade().is_none() {
+                                break;
+                            }
+                            log::warn!("could not update runtime transcript: {error:#}");
+                            view.update(cx, |thread, cx| {
+                                projection_notice(
+                                    thread,
+                                    "Could not read saved messages",
+                                    "Reopen the conversation to retry.",
+                                    cx,
+                                );
+                            })
+                            .log_err();
                         }
                     }
                     loop {
@@ -687,7 +698,7 @@ impl NativeRuntimeConnection {
             Ok(page
                 .entries
                 .iter()
-                .filter_map(|entry| history_text(&entry.payload))
+                .filter_map(|entry| history_text(&entry.payload).ok().flatten())
                 .map(|(_, text)| text)
                 .collect::<Vec<_>>()
                 .join("\n\n")
@@ -1268,24 +1279,34 @@ async fn flush_projection(
     if view.upgrade().is_none() {
         return Ok(false);
     }
-    let after = position.get();
-    let entries = store
-        .transcript_after(agent_id.to_owned(), after, PAGE_SIZE)
-        .await?;
-    if !entries.is_empty() {
-        view.update(cx, |thread, cx| {
-            // A prompt completion and its observer may have read the same page concurrently.
-            let entries = entries
-                .into_iter()
-                .filter(|entry| entry.position > position.get())
-                .collect::<Vec<_>>();
-            if let Some(last) = entries.last() {
-                position.set(last.position);
+    loop {
+        let entries = store
+            .transcript_after(agent_id.to_owned(), position.get(), PAGE_SIZE)
+            .await?;
+        if entries.is_empty() {
+            break;
+        }
+        for entry in entries {
+            // A prompt completion and its observer may have read the same page.
+            if entry.position <= position.get() {
+                continue;
             }
-            project_history(thread, entries, false, cx);
-        })?;
+            // Let the live view handle each append before changing the entry count again.
+            view.update(cx, |thread, cx| {
+                project_history_entry(thread, &entry, false, cx);
+                position.set(entry.position);
+            })?;
+        }
+        // A short page can hit the byte limit before the row limit.
+        futures_lite::future::yield_now().await;
     }
-    let usage = store.last_provider_usage(agent_id.to_owned()).await?;
+    let usage = match store.last_provider_usage(agent_id.to_owned()).await {
+        Ok(usage) => usage,
+        Err(error) => {
+            log::warn!("could not read runtime usage: {error:#}");
+            return Ok(view.upgrade().is_some());
+        }
+    };
     view.update(cx, |thread, cx| {
         let Some(record) = usage else {
             projected_usage.borrow_mut().take();
@@ -1328,32 +1349,60 @@ async fn flush_projection(
     Ok(true)
 }
 
-fn history_text(payload: &Value) -> Option<(bool, String)> {
-    let content = payload.get("content")?;
-    match payload.get("kind")?.as_str()? {
-        "user" => content
-            .get("text")
+fn history_text(payload: &Value) -> Result<Option<(bool, String)>> {
+    let content = payload.get("content");
+    match payload.get("kind").and_then(Value::as_str) {
+        Some("user") => Ok(content
+            .and_then(|content| content.get("text"))
             .and_then(Value::as_str)
-            .map(|text| (false, text.to_owned())),
-        "assistant" if content.get("type").and_then(Value::as_str) == Some("text") => content
-            .get("text")
-            .and_then(Value::as_str)
-            .map(|text| (false, text.to_owned())),
-        "assistant" => content
-            .get("content")
-            .and_then(Value::as_array)
-            .map(|blocks| {
-                (
-                    true,
-                    blocks
-                        .iter()
-                        .filter_map(|block| block.get("text").and_then(Value::as_str))
-                        .collect::<Vec<_>>()
-                        .join(""),
-                )
-            }),
-        _ => None,
+            .map(|text| (false, text.to_owned()))),
+        Some("assistant") => assistant_history_text(content.context("missing assistant content")?),
+        _ => Ok(None),
     }
+}
+
+fn assistant_history_text(content: &Value) -> Result<Option<(bool, String)>> {
+    let content_type = content
+        .get("type")
+        .map(|tag| tag.as_str().context("invalid assistant content type"))
+        .transpose()?;
+    // Infinity's AssistantContent is untagged. Older projections also accepted tagged text.
+    if matches!(content_type, None | Some("text"))
+        && let Some(text) = content.get("text")
+    {
+        let text = text.as_str().context("invalid assistant text")?;
+        return Ok((!text.is_empty()).then(|| (false, text.to_owned())));
+    }
+    ensure!(
+        matches!(content_type, None | Some("reasoning")),
+        "unsupported assistant content type"
+    );
+    let blocks = content
+        .get("content")
+        .and_then(Value::as_array)
+        .context("unsupported assistant content shape")?;
+    let mut thinking = String::new();
+    for block in blocks {
+        let text = match block.get("type").and_then(Value::as_str) {
+            Some("text") => block
+                .pointer("/content/text")
+                .or_else(|| block.get("text"))
+                .and_then(Value::as_str)
+                .context("invalid reasoning text")?,
+            Some("summary") => block
+                .get("content")
+                .and_then(Value::as_str)
+                .context("invalid reasoning summary")?,
+            Some("provider_state" | "encrypted" | "redacted") => continue,
+            None if block.get("type").is_none() => block
+                .get("text")
+                .and_then(Value::as_str)
+                .context("unsupported reasoning block")?,
+            _ => anyhow::bail!("unsupported reasoning block type"),
+        };
+        thinking.push_str(text);
+    }
+    Ok((!thinking.is_empty()).then_some((true, thinking)))
 }
 
 fn project_history(
@@ -1363,23 +1412,69 @@ fn project_history(
     cx: &mut gpui::Context<AcpThread>,
 ) {
     for entry in entries {
-        let user = entry.payload.get("kind").and_then(Value::as_str) == Some("user");
-        if user && !replay_users {
-            continue;
-        }
-        if let Some((thinking, text)) = history_text(&entry.payload) {
-            if user {
-                thread.push_user_content_block(None, text.into(), cx);
-            } else {
-                thread.push_assistant_content_block(text.into(), thinking, cx);
-            }
-        } else if let Some(update) = history_tool_update(&entry.payload) {
-            thread.update_tool_call(update, cx).log_err();
-        } else if user {
-            if let Some(content) = entry.payload.get("content").and_then(history_content) {
+        project_history_entry(thread, &entry, replay_users, cx);
+    }
+}
+
+fn project_history_entry(
+    thread: &mut AcpThread,
+    entry: &TranscriptEntry,
+    replay_users: bool,
+    cx: &mut gpui::Context<AcpThread>,
+) {
+    let result = (|| -> Result<()> {
+        let payload = &entry.payload;
+        match payload.get("kind").and_then(Value::as_str) {
+            Some("user") if replay_users => {
+                let content = history_text(payload)?
+                    .map(|(_, text)| text.into())
+                    .or_else(|| payload.get("content").and_then(history_content))
+                    .context("unsupported user content")?;
                 thread.push_user_content_block(None, content, cx);
             }
+            Some("assistant") => {
+                if let Some((thinking, text)) = history_text(payload)? {
+                    thread.push_assistant_content_block(text.into(), thinking, cx);
+                }
+            }
+            Some("tool_call" | "tool_result") => {
+                let update = history_tool_update(payload).context("unsupported tool content")?;
+                thread.update_tool_call(update, cx)?;
+            }
+            Some("user" | "subscription_event") => {}
+            _ => anyhow::bail!("unsupported history record kind"),
         }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        log::warn!(
+            "could not display runtime history row {}: {error:#}",
+            entry.position
+        );
+        projection_notice(
+            thread,
+            "Some saved messages could not be displayed",
+            "The original messages are still saved. See the Zed log for details.",
+            cx,
+        );
+    }
+}
+
+fn projection_notice(
+    thread: &mut AcpThread,
+    title: &'static str,
+    description: &'static str,
+    cx: &mut gpui::Context<AcpThread>,
+) {
+    if !thread
+        .notices()
+        .iter()
+        .any(|(_, notice)| notice.title == title)
+    {
+        thread.push_notice(
+            acp_v2::Notice::new(acp_v2::NoticeSeverity::Warning, title).description(description),
+            cx,
+        );
     }
 }
 
@@ -1556,6 +1651,10 @@ mod tests {
     use super::*;
     use fs::FakeFs;
     use gpui::{TestAppContext, UpdateGlobal as _};
+    use infinity_agent_core::{ThreadId, message::InfinityMessage, traits::ConversationStore as _};
+    use infinity_provider_protocol::message::{
+        AssistantContent, Reasoning, ReasoningContent, UserContent,
+    };
     use language_model::{
         LanguageModelCompletionEvent, LanguageModelToolUse, LanguageModelToolUseInput, StopReason,
     };
@@ -1635,9 +1734,13 @@ mod tests {
         ));
         let reopened = cx
             .update(|cx| {
-                reopened_connection
-                    .clone()
-                    .load_session(session.clone(), project, work_dirs, None, cx)
+                reopened_connection.clone().load_session(
+                    session.clone(),
+                    project.clone(),
+                    work_dirs.clone(),
+                    None,
+                    cx,
+                )
             })
             .await
             .expect("reopen the conversation with its saved model");
@@ -1678,23 +1781,54 @@ mod tests {
         })
         .await
         .expect("select a model from the live catalog");
-        let execution = reopened.update(cx, |thread, cx| thread.send(vec!["Hello".into()], cx));
-        wait_until(|| !provider.pending_completions_for(&model).is_empty()).await;
-        let request = provider.pending_completions_for(&model).remove(0);
-        provider.send_text(&model, &request, "Hello from the runtime.");
-        provider.send_event(
-            &model,
-            &request,
-            LanguageModelCompletionEvent::Stop(StopReason::EndTurn),
-        );
-        provider.end_stream(&model, &request);
-        execution
+        let turns = [
+            ("Hello", "First answer from Infinity."),
+            ("Continue", "Second answer from Infinity."),
+        ];
+        for (prompt, answer) in turns {
+            let execution = reopened.update(cx, |thread, cx| thread.send(vec![prompt.into()], cx));
+            wait_until(|| !provider.pending_completions_for(&model).is_empty()).await;
+            let request = provider.pending_completions_for(&model).remove(0);
+            provider.send_text(&model, &request, answer);
+            provider.send_event(
+                &model,
+                &request,
+                LanguageModelCompletionEvent::Stop(StopReason::EndTurn),
+            );
+            provider.end_stream(&model, &request);
+            execution
+                .await
+                .expect("completion in the recovered conversation");
+        }
+        let live_markdown = reopened.read_with(cx, |thread, cx| thread.to_markdown(cx));
+        drop(reopened);
+        drop(thread);
+        let replayed = cx
+            .update(|cx| {
+                reopened_connection.clone().load_session(
+                    session.clone(),
+                    project,
+                    work_dirs,
+                    None,
+                    cx,
+                )
+            })
             .await
-            .expect("completion in the recovered conversation");
+            .expect("replay the saved conversation");
         assert_eq!(
-            reopened.read_with(cx, |thread, _| thread.session_id().clone()),
+            replayed.read_with(cx, |thread, _| thread.session_id().clone()),
             session
         );
+        let replayed_markdown = replayed.read_with(cx, |thread, cx| thread.to_markdown(cx));
+        for (_, answer) in turns {
+            assert_eq!(live_markdown.matches(answer).count(), 1, "live transcript");
+            assert_eq!(
+                replayed_markdown.matches(answer).count(),
+                1,
+                "replayed transcript"
+            );
+        }
+        assert!(replayed.read_with(cx, |thread, _| thread.notices().is_empty()));
     }
 
     #[gpui::test]
@@ -1855,6 +1989,9 @@ mod tests {
         );
         provider.end_stream(&model, &request);
         execution.await.expect("completion");
+        assert!(thread.read_with(cx, |thread, cx| {
+            thread.to_markdown(cx).contains("Read successfully.")
+        }));
         assert_eq!(
             thread.read_with(cx, |thread, _| thread.token_usage().cloned()),
             Some(acp_thread::TokenUsage {
@@ -1867,23 +2004,93 @@ mod tests {
         );
         let id = runtime_id(&session).expect("runtime id").to_owned();
         let (view, position, usage) = {
-            let projections = connection.views.borrow();
-            let projection = projections.get(&id).expect("projection");
+            let mut projections = connection.views.borrow_mut();
+            let projection = projections.get_mut(&id).expect("projection");
+            // Exercise one flush without an observer racing to read a second page.
+            projection._observer = Task::ready(());
             (
                 projection.view.clone(),
                 projection.position.clone(),
                 projection.usage.clone(),
             )
         };
+        let provider_state = InfinityMessage::Assistant {
+            content: AssistantContent::Reasoning(Reasoning {
+                id: None,
+                content: vec![provider_state_block()],
+            }),
+        };
+        let mut history = (0..PAGE_SIZE)
+            .map(|index| (provider_state.clone(), format!("projection-state-{index}")))
+            .collect::<Vec<_>>();
+        history.push((
+            InfinityMessage::Assistant {
+                content: AssistantContent::ToolCall(
+                    infinity_provider_protocol::message::ToolCall::new(
+                        "unexpected-assistant-call",
+                        "unsupported_shape",
+                        json!({}),
+                    ),
+                ),
+            },
+            "projection-unsupported".into(),
+        ));
+        history.push((
+            InfinityMessage::ToolCall {
+                call: infinity_provider_protocol::message::ToolCall::new(
+                    "projection-call",
+                    "read_file",
+                    json!({"path":"example.txt"}),
+                ),
+                display_as: None,
+            },
+            "projection-tool-call".into(),
+        ));
+        let last_answer = "Visible answer from the next page.";
+        history.push((
+            InfinityMessage::Assistant {
+                content: AssistantContent::text(last_answer),
+            },
+            "projection-answer".into(),
+        ));
+        let last_position = position.get() + history.len() as i64;
+        agent_runtime::SqliteInfinityStore::new(runtime.store.clone())
+            .append_messages(ThreadId::from_ref(&id), history)
+            .await
+            .expect("persist a burst spanning transcript pages");
+        let initial_entry_count = thread.read_with(cx, |thread, _| thread.entries().len());
+        let live_entry_counts = Rc::new(RefCell::new(Vec::new()));
+        let _entry_subscription = cx.update(|cx| {
+            let counts = live_entry_counts.clone();
+            cx.subscribe(&thread, move |thread, event, cx| {
+                if matches!(event, acp_thread::AcpThreadEvent::NewEntry) {
+                    counts.borrow_mut().push(thread.read(cx).entries().len());
+                }
+            })
+        });
         let store = runtime.store.clone();
         cx.update(|cx| {
             cx.spawn(async move |cx| {
+                flush_projection(&store, &id, &view, &position, &usage, cx).await?;
+                assert_eq!(position.get(), last_position);
                 flush_projection(&store, &id, &view, &position, &usage, cx).await
             })
         })
         .await
         .expect("repeat projection");
         cx.run_until_parked();
+        assert_eq!(
+            *live_entry_counts.borrow(),
+            [initial_entry_count + 1, initial_entry_count + 2]
+        );
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(thread.to_markdown(cx).matches(last_answer).count(), 1);
+            assert_eq!(
+                thread.notices().len(),
+                1,
+                "unsupported history should be reported once"
+            );
+        });
         assert_eq!(
             output_tokens.get(),
             7,
@@ -2019,20 +2226,79 @@ mod tests {
 
     #[test]
     fn transcript_projection_preserves_thinking_and_user_roles() {
+        let user = serde_json::to_value(InfinityMessage::User {
+            content: UserContent::text("request"),
+        })
+        .unwrap();
+        let assistant = serde_json::to_value(InfinityMessage::Assistant {
+            content: AssistantContent::text("answer"),
+        })
+        .unwrap();
         assert_eq!(
-            history_text(&json!({"kind":"user","content":{"type":"text","text":"request"}})),
+            assistant,
+            json!({"kind":"assistant","content":{"text":"answer"}})
+        );
+        let reasoning = serde_json::to_value(InfinityMessage::Assistant {
+            content: AssistantContent::Reasoning(Reasoning {
+                id: None,
+                content: vec![
+                    ReasoningContent::Text {
+                        text: "thinking ".into(),
+                        signature: Some("signed".into()),
+                    },
+                    ReasoningContent::Summary("summary".into()),
+                ],
+            }),
+        })
+        .unwrap();
+        assert_eq!(
+            history_text(&user).unwrap(),
             Some((false, "request".into()))
         );
         assert_eq!(
-            history_text(&json!({"kind":"assistant","content":{"type":"text","text":"answer"}})),
+            history_text(&assistant).unwrap(),
+            Some((false, "answer".into()))
+        );
+        assert_eq!(
+            history_text(&reasoning).unwrap(),
+            Some((true, "thinking summary".into()))
+        );
+        assert_eq!(
+            history_text(&json!({"kind":"assistant","content":{"type":"text","text":"answer"}}))
+                .unwrap(),
             Some((false, "answer".into()))
         );
         assert_eq!(
             history_text(
                 &json!({"kind":"assistant","content":{"type":"reasoning","content":[{"type":"text","text":"reasoning","signature":"signed"}]}})
-            ),
+            ).unwrap(),
             Some((true, "reasoning".into()))
         );
+    }
+
+    fn provider_state_block() -> ReasoningContent {
+        ReasoningContent::ProviderState {
+            namespace: "zed.language-model.v1".into(),
+            value: json!({"kind":"stop","reason":"end_turn"}),
+        }
+    }
+
+    #[test]
+    fn transcript_projection_omits_opaque_reasoning() {
+        let payload = serde_json::to_value(InfinityMessage::Assistant {
+            content: AssistantContent::Reasoning(Reasoning {
+                id: None,
+                content: vec![
+                    provider_state_block(),
+                    ReasoningContent::Encrypted("encrypted".into()),
+                    ReasoningContent::Redacted {
+                        data: "redacted".into(),
+                    },
+                ],
+            }),
+        })
+        .unwrap();
+        assert_eq!(history_text(&payload).unwrap(), None);
     }
 
     #[test]
