@@ -116,6 +116,29 @@ impl NativeRuntimeConnection {
         })
     }
 
+    pub fn validate_prompt_model(
+        &self,
+        session_id: &acp_v2::SessionId,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        let Some(id) = runtime_id(session_id) else {
+            return Task::ready(Ok(()));
+        };
+        if !self.configurations.borrow().contains_key(id) {
+            return Task::ready(Ok(()));
+        }
+        let id = id.to_owned();
+        let store = self.store(cx);
+        cx.spawn(async move |cx| {
+            let configuration = serde_json::from_value(store?.metadata(id).await?)?;
+            cx.update(|cx| {
+                configured_model(&configuration, cx)
+                    .map(|_| ())
+                    .map_err(|error| error.context(crate::NoModelConfiguredError))
+            })
+        })
+    }
+
     pub fn available_skills(
         &self,
         session: &acp_v2::SessionId,
@@ -822,11 +845,7 @@ impl AgentConnection for NativeRuntimeConnection {
         let Some((view, position, usage)) = projection else {
             return Task::ready(Err(anyhow::anyhow!("conversation projection is detached")));
         };
-        if let Some(configuration) = self.configurations.borrow().get(&id)
-            && let Err(error) = configured_model(configuration, cx)
-        {
-            return Task::ready(Err(error.context(crate::NoModelConfiguredError)));
-        }
+        let model_check = self.validate_prompt_model(&params.session_id, cx);
         let content = view
             .read_with(cx, |thread, cx| {
                 params
@@ -864,6 +883,7 @@ impl AgentConnection for NativeRuntimeConnection {
         };
         let read_skill = crate::skill_body_resolver_for_project(project, self.fs.clone());
         cx.spawn(async move |cx| {
+            model_check.await?;
             ensure_no_uncertain_tools(&store, &id).await?;
             if let Some(skill) = skill {
                 let body = match skill.embedded_body { Some(body) => body.to_owned(), None => read_skill(skill.clone(), cx).await? };
@@ -1590,10 +1610,14 @@ mod tests {
             .expect("open a conversation with an unavailable model");
         let session = thread.read_with(cx, |thread, _| thread.session_id().clone());
         let id = runtime_id(&session).expect("runtime session").to_owned();
-        drop(thread);
+        let reopened_connection = Rc::new(NativeRuntimeConnection::new(
+            connection.legacy.clone(),
+            connection.host.clone(),
+            connection.fs.clone(),
+        ));
         let reopened = cx
             .update(|cx| {
-                connection
+                reopened_connection
                     .clone()
                     .load_session(session.clone(), project, work_dirs, None, cx)
             })
@@ -1605,7 +1629,7 @@ mod tests {
 
         let prompt = || acp_v2::PromptRequest::new(session.clone(), vec!["Hello".into()]);
         let error = cx
-            .update(|cx| connection.prompt(prompt(), cx))
+            .update(|cx| reopened_connection.prompt(prompt(), cx))
             .await
             .expect_err("the unavailable selection must block inference");
         assert!(error.is::<crate::NoModelConfiguredError>());
@@ -1628,7 +1652,7 @@ mod tests {
         })
         .await
         .expect("select a model from the live catalog");
-        let execution = cx.update(|cx| connection.prompt(prompt(), cx));
+        let execution = cx.update(|cx| reopened_connection.prompt(prompt(), cx));
         wait_until(|| !provider.pending_completions_for(&model).is_empty()).await;
         let request = provider.pending_completions_for(&model).remove(0);
         provider.send_text(&model, &request, "Hello from the runtime.");

@@ -1474,6 +1474,15 @@ impl ThreadView {
             .thread(acp_thread.session_id(), cx)
     }
 
+    fn runtime_thread_model(&self, cx: &App) -> Option<agent::ThreadModel> {
+        let thread = self.thread.read(cx);
+        let connection = thread
+            .connection()
+            .clone()
+            .downcast::<agent::NativeRuntimeConnection>()?;
+        connection.thread_model(thread.session_id(), cx)
+    }
+
     /// Resolves the message editor's contents into content blocks. For profiles
     /// that do not enable any tools, directory mentions are expanded to inline
     /// file contents since the agent can't read files on its own.
@@ -2337,6 +2346,13 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let thread = self.thread.read(cx);
+        let session_id = thread.session_id().clone();
+        let runtime = thread
+            .connection()
+            .clone()
+            .downcast::<agent::NativeRuntimeConnection>();
+        let model_check = runtime.map(|runtime| runtime.validate_prompt_model(&session_id, cx));
         let contents = self.resolve_message_contents(&message_editor, cx);
 
         self.thread_error.take();
@@ -2359,6 +2375,10 @@ impl ThreadView {
 
             if contents.is_empty() {
                 return Ok(None);
+            }
+
+            if let Some(model_check) = model_check {
+                model_check.await?;
             }
 
             let _ = cx.update(|window, cx| {
@@ -12829,12 +12849,7 @@ impl ThreadView {
         let thread_model = if let Some(thread) = &legacy_thread {
             thread.read(cx).thread_model()
         } else {
-            let thread = self.thread.read(cx);
-            let connection = thread
-                .connection()
-                .clone()
-                .downcast::<agent::NativeRuntimeConnection>()?;
-            runtime_model = connection.thread_model(thread.session_id(), cx)?;
+            runtime_model = self.runtime_thread_model(cx)?;
             &runtime_model
         };
 
