@@ -5592,12 +5592,9 @@ impl ThreadView {
                                     .children(discard_draft_button)
                                     .children(self.render_token_usage(cx))
                                     .children(self.profile_selector.clone())
-                                    .map(|this| match self.config_options_view.clone() {
-                                        Some(config_view) => this.child(config_view),
-                                        None => this
-                                            .children(self.mode_selector.clone())
-                                            .children(self.model_selector.clone()),
-                                    })
+                                    .children(self.config_options_view.clone())
+                                    .children(self.mode_selector.clone())
+                                    .children(self.model_selector.clone())
                                     .child(self.render_send_button(cx)),
                             ),
                     ),
@@ -12827,54 +12824,64 @@ impl ThreadView {
     }
 
     fn render_model_not_available_error(&self, cx: &mut Context<Self>) -> Option<Callout> {
-        let thread = self.as_native_thread(cx)?;
+        let legacy_thread = self.as_native_thread(cx);
+        let runtime_model;
+        let thread_model = if let Some(thread) = &legacy_thread {
+            thread.read(cx).thread_model()
+        } else {
+            let thread = self.thread.read(cx);
+            let connection = thread
+                .connection()
+                .clone()
+                .downcast::<agent::NativeRuntimeConnection>()?;
+            runtime_model = connection.thread_model(thread.session_id(), cx)?;
+            &runtime_model
+        };
 
         let has_authenticated_provider =
             LanguageModelRegistry::read_global(cx).has_authenticated_provider(cx);
 
-        let (title, description): (SharedString, SharedString) =
-            match thread.read(cx).thread_model() {
-                agent::ThreadModel::Ready(_) => return None,
-                agent::ThreadModel::Unresolved(selected_model) => {
-                    if let Some(provider) = LanguageModelRegistry::global(cx)
-                        .read(cx)
-                        .provider(&&selected_model.provider)
-                    {
-                        if !provider.is_authenticated(cx) {
-                            (
-                                format!("Failed to authenticate with {} provider", provider.name())
-                                    .into(),
-                                "Open the settings to configure the selected provider".into(),
-                            )
-                        } else {
-                            (
-                                format!("Model {} was not found", selected_model.model.0).into(),
-                                "You may need to reconfigure authentication for this provider"
-                                    .into(),
-                            )
-                        }
-                    } else {
+        let (title, description): (SharedString, SharedString) = match thread_model {
+            agent::ThreadModel::Ready(_) => return None,
+            agent::ThreadModel::Unresolved(selected_model) => {
+                if let Some(provider) = LanguageModelRegistry::global(cx)
+                    .read(cx)
+                    .provider(&&selected_model.provider)
+                {
+                    if !provider.is_authenticated(cx) {
                         (
-                            format!("Provider {} was not found", selected_model.provider).into(),
-                            "Open the settings to configure providers".into(),
-                        )
-                    }
-                }
-                agent::ThreadModel::Unset => {
-                    if has_authenticated_provider {
-                        (
-                            "No model selected".into(),
-                            "Choose a different model or configure other providers to get started"
+                            format!("Failed to authenticate with {} provider", provider.name())
                                 .into(),
+                            "Open the settings to configure the selected provider".into(),
                         )
                     } else {
                         (
-                            "No model selected".into(),
-                            "Configure a provider to get started".into(),
+                            format!("Model {} was not found", selected_model.model.0).into(),
+                            "Choose an available model or check the provider in Settings".into(),
                         )
                     }
+                } else {
+                    (
+                        format!("Provider {} was not found", selected_model.provider).into(),
+                        "Open the settings to configure providers".into(),
+                    )
                 }
-            };
+            }
+            agent::ThreadModel::Unset => {
+                if has_authenticated_provider {
+                    (
+                        "No model selected".into(),
+                        "Choose a different model or configure other providers to get started"
+                            .into(),
+                    )
+                } else {
+                    (
+                        "No model selected".into(),
+                        "Configure a provider to get started".into(),
+                    )
+                }
+            }
+        };
 
         let callout = Callout::new()
             .severity(Severity::Error)

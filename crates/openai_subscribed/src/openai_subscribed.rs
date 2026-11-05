@@ -51,6 +51,7 @@ const MODEL_CATALOG_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// The authenticated catalog can take tens of seconds to respond, so the request
 /// keeps running in the background well past [`MODEL_CATALOG_WAIT_TIMEOUT`].
 const MODEL_CATALOG_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const MODEL_CATALOG_REFRESH_COOLDOWN: Duration = Duration::from_secs(30);
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct CodexCredentials {
@@ -74,6 +75,12 @@ enum SignInState {
     PersistingCredentials { _task: Task<Result<()>> },
 }
 
+enum ModelCatalogRefresh {
+    Idle,
+    InFlight,
+    CoolingDown(Task<()>),
+}
+
 pub struct State {
     credentials: Option<CodexCredentials>,
     sign_in_state: SignInState,
@@ -85,6 +92,7 @@ pub struct State {
     available_models: Vec<ChatGptModel>,
     auth_generation: u64,
     model_catalog_generation: u64,
+    model_catalog_refresh: ModelCatalogRefresh,
     last_auth_error: Option<SharedString>,
     last_model_catalog_error: Option<SharedString>,
 }
@@ -179,6 +187,7 @@ impl State {
             available_models: ChatGptModel::all(),
             auth_generation: 0,
             model_catalog_generation: 0,
+            model_catalog_refresh: ModelCatalogRefresh::Idle,
             last_auth_error: None,
             last_model_catalog_error: None,
         }
@@ -240,11 +249,27 @@ impl State {
         self.load_task.clone()
     }
 
+    pub fn request_model_catalog_refresh(&mut self, cx: &mut Context<Self>) {
+        if !self.is_authenticated() || self.is_signing_in() {
+            return;
+        }
+        match &self.model_catalog_refresh {
+            ModelCatalogRefresh::Idle => {}
+            ModelCatalogRefresh::CoolingDown(timer) if timer.is_ready() => {}
+            _ => return,
+        }
+
+        let refresh = self.refresh_model_catalog(cx);
+        cx.spawn(async move |_, _| log_model_catalog_error(refresh.await))
+            .detach();
+    }
+
     fn refresh_model_catalog(
         &mut self,
         cx: &mut Context<Self>,
     ) -> Task<Result<(), Arc<anyhow::Error>>> {
         self.model_catalog_generation = self.model_catalog_generation.wrapping_add(1);
+        self.model_catalog_refresh = ModelCatalogRefresh::InFlight;
         let model_catalog_generation = self.model_catalog_generation;
         let http_client = self.http_client.clone();
         let client_version = self.client_version.clone();
@@ -266,36 +291,39 @@ impl State {
                     )),
                 }
             }
-            .await;
+            .await
+            .map_err(Arc::new);
 
-            match result {
-                Ok(models) => this
-                    .update(cx, |state, cx| {
-                        if state.model_catalog_generation == model_catalog_generation {
-                            state.available_models = models;
-                            state.last_model_catalog_error = None;
-                            cx.notify();
-                        }
-                    })
-                    .map_err(Arc::new),
-                Err(error) => {
-                    let error = Arc::new(error);
-                    this.update(cx, |state, cx| {
-                        if state.model_catalog_generation == model_catalog_generation {
-                            state.last_model_catalog_error =
-                                Some(format!("Failed to load models: {error:#}").into());
-                            cx.notify();
-                        }
-                    })
-                    .map_err(Arc::new)?;
-                    Err(error)
+            this.update(cx, |state, cx| {
+                if state.model_catalog_generation != model_catalog_generation {
+                    return result.map(|_| ());
                 }
-            }
+                state.model_catalog_refresh = ModelCatalogRefresh::CoolingDown(
+                    cx.background_executor()
+                        .timer(MODEL_CATALOG_REFRESH_COOLDOWN),
+                );
+                let result = match result {
+                    Ok(models) => {
+                        state.available_models = models;
+                        state.last_model_catalog_error = None;
+                        Ok(())
+                    }
+                    Err(error) => {
+                        state.last_model_catalog_error =
+                            Some(format!("Failed to load models: {error:#}").into());
+                        Err(error)
+                    }
+                };
+                cx.notify();
+                result
+            })
+            .map_err(Arc::new)?
         })
     }
 
     fn reset_model_catalog(&mut self) {
         self.model_catalog_generation = self.model_catalog_generation.wrapping_add(1);
+        self.model_catalog_refresh = ModelCatalogRefresh::Idle;
         self.available_models = ChatGptModel::all();
         self.last_model_catalog_error = None;
     }
@@ -1932,6 +1960,66 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_model_catalog_refresh_retries_after_cooldown(cx: &mut TestAppContext) {
+        let (release_request, blocked_request) = futures::channel::oneshot::channel::<()>();
+        let blocked_request = Arc::new(Mutex::new(Some(blocked_request)));
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let http_client = FakeHttpClient::create({
+            let request_count = request_count.clone();
+            move |_| {
+                let request_count = request_count.clone();
+                let blocked_request = blocked_request.clone();
+                async move {
+                    if request_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                        let receiver = blocked_request.lock().take().expect("first request");
+                        receiver.await.expect("request should be released");
+                        return Ok(http_client::Response::builder()
+                            .status(503)
+                            .body(http_client::AsyncBody::from("catalog unavailable"))?);
+                    }
+                    let catalog = serde_json::json!({
+                        "models": [{
+                            "slug": "gpt-account-new",
+                            "display_name": "Account New",
+                            "visibility": "list",
+                            "priority": 0
+                        }]
+                    });
+                    Ok(http_client::Response::builder()
+                        .status(200)
+                        .body(http_client::AsyncBody::from(catalog.to_string()))?)
+                }
+            }
+        });
+        let state = make_state(http_client, Some(make_fresh_credentials()), cx);
+
+        state.update(cx, |state, cx| state.request_model_catalog_refresh(cx));
+        cx.run_until_parked();
+        state.update(cx, |state, cx| state.request_model_catalog_refresh(cx));
+        cx.run_until_parked();
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+
+        release_request.send(()).expect("first request is pending");
+        cx.run_until_parked();
+        cx.read(|cx| assert!(state.read(cx).model_catalog_error().is_some()));
+        state.update(cx, |state, cx| state.request_model_catalog_refresh(cx));
+        cx.run_until_parked();
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+
+        cx.executor().advance_clock(MODEL_CATALOG_REFRESH_COOLDOWN);
+        cx.run_until_parked();
+        state.update(cx, |state, cx| state.request_model_catalog_refresh(cx));
+        cx.run_until_parked();
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        cx.read(|cx| {
+            let state = state.read(cx);
+            assert!(state.model_catalog_error().is_none());
+            assert_eq!(state.available_models().len(), 1);
+            assert_eq!(state.available_models()[0].id(), "gpt-account-new");
+        });
+    }
+
+    #[gpui::test]
     async fn test_model_catalog_request_times_out(cx: &mut TestAppContext) {
         let http_client = FakeHttpClient::create(|_| {
             futures::future::pending::<Result<http_client::Response<AsyncBody>>>()
@@ -2421,6 +2509,7 @@ mod tests {
             available_models: ChatGptModel::all(),
             auth_generation: 0,
             model_catalog_generation: 0,
+            model_catalog_refresh: ModelCatalogRefresh::Idle,
             last_auth_error: None,
             last_model_catalog_error: None,
         })

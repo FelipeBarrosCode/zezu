@@ -130,6 +130,11 @@ impl LanguageModelProvider for OpenAiSubscribedProvider {
         }
     }
 
+    fn refresh_models(&self, cx: &mut App) {
+        self.state
+            .update(cx, |state, cx| state.request_model_catalog_refresh(cx));
+    }
+
     fn settings_view(&self, cx: &mut App) -> Option<ProviderSettingsView> {
         let is_authenticated = self.state.read(cx).is_authenticated();
         let title = if is_authenticated {

@@ -20,7 +20,9 @@ use futures::FutureExt as _;
 use gpui::{
     App, AppContext as _, AsyncApp, Entity, Global, SharedString, Task, TaskExt as _, WeakEntity,
 };
-use language_model::{LanguageModelRegistry, MessageContent};
+use language_model::{
+    LanguageModelId, LanguageModelProviderId, LanguageModelRegistry, MessageContent, SelectedModel,
+};
 use project::{AgentId, Project};
 use serde_json::{Value, json};
 use settings::Settings as _;
@@ -95,6 +97,25 @@ impl NativeRuntimeConnection {
         &self.legacy
     }
 
+    pub fn thread_model(
+        &self,
+        session_id: &acp_v2::SessionId,
+        cx: &App,
+    ) -> Option<crate::ThreadModel> {
+        let configurations = self.configurations.borrow();
+        let configuration = configurations.get(runtime_id(session_id)?)?;
+        Some(match configured_model(configuration, cx) {
+            Ok(model) => crate::ThreadModel::Ready(model),
+            Err(_) => match &configuration.model {
+                Some(selection) => crate::ThreadModel::Unresolved(SelectedModel {
+                    provider: LanguageModelProviderId(selection.provider.0.clone().into()),
+                    model: LanguageModelId(selection.model.clone().into()),
+                }),
+                None => crate::ThreadModel::Unset,
+            },
+        })
+    }
+
     pub fn available_skills(
         &self,
         session: &acp_v2::SessionId,
@@ -134,40 +155,39 @@ impl NativeRuntimeConnection {
         let host = self.host.clone();
         let configurations = self.configurations.clone();
         let skills = self.skills.clone();
+        let settings = AgentSettings::get_global(cx);
         let profile = configuration
             .profile
             .clone()
-            .unwrap_or_else(|| AgentSettings::get_global(cx).default_profile.clone());
-        let selected = configuration.model.as_ref().or_else(|| {
-            AgentSettings::get_global(cx)
-                .profiles
-                .get(&profile)
-                .and_then(|profile| profile.default_model.as_ref())
-        });
+            .unwrap_or_else(|| settings.default_profile.clone());
+        let selected = configuration
+            .model
+            .as_ref()
+            .or_else(|| settings.profiles.get(&profile)?.default_model.as_ref())
+            .or(settings.default_model.as_ref());
         let model = match selected {
             Some(selection) => crate::native_runtime::resolve_model_id(
                 &format!("{}/{}", selection.provider.0, selection.model),
                 cx,
-            ),
-            None => LanguageModelRegistry::read_global(cx)
-                .default_model()
-                .context("select a model before starting an agent"),
+            )
+            .ok(),
+            None => LanguageModelRegistry::read_global(cx).default_model(),
         };
-        let model = match model {
-            Ok(model) => model,
-            Err(error) => return Task::ready(Err(error)),
-        };
-        let selected = selected.or_else(|| {
-            AgentSettings::get_global(cx)
-                .default_model
-                .as_ref()
-                .filter(|selection| {
-                    selection.provider.0 == model.provider_id().0.as_ref()
-                        && selection.model == model.id().0.as_ref()
-                })
-        });
-        let pinned_model = language_model_to_selection(&model, selected);
-        let provider = model.provider_id();
+        // A provider can populate its catalog after the conversation opens. Keep the
+        // requested selection so the picker can recover without changing models implicitly.
+        let pinned_model = model
+            .as_ref()
+            .map(|model| language_model_to_selection(model, selected))
+            .or_else(|| selected.cloned());
+        let provider = pinned_model
+            .as_ref()
+            .map(|selection| LanguageModelProviderId(selection.provider.0.clone().into()));
+        if model.is_none()
+            && let Some(provider) = provider.as_ref()
+            && let Some(provider) = LanguageModelRegistry::read_global(cx).provider(provider)
+        {
+            provider.refresh_models(cx);
+        }
         let registry = match RuntimeWorkspaceProjects::new(
             project.clone(),
             AgentSettings::get_global(cx)
@@ -187,28 +207,33 @@ impl NativeRuntimeConnection {
             payload: json!({}),
             result: None,
         };
-        let actions = registry.read(cx).code_actions_for(&catalog_job);
-        let catalog = RuntimeMcpCatalog::new(project.clone(), cx);
-        let mut tools = match runtime_project_tools(
-            project.clone(),
-            &id,
-            &provider,
-            &profile,
-            actions.clone(),
-            cx,
-        ) {
-            Ok(tools) => tools,
-            Err(error) => return Task::ready(Err(error)),
+        let tool_names = if let Some(provider) = &provider {
+            let actions = registry.read(cx).code_actions_for(&catalog_job);
+            let catalog = RuntimeMcpCatalog::new(project.clone(), cx);
+            let mut tools = match runtime_project_tools(
+                project.clone(),
+                &id,
+                provider,
+                &profile,
+                actions,
+                cx,
+            ) {
+                Ok(tools) => tools,
+                Err(error) => return Task::ready(Err(error)),
+            };
+            if let Err(error) = catalog.merge_into(&mut tools, &profile, provider, cx) {
+                return Task::ready(Err(error));
+            }
+            tools.keys().cloned().collect()
+        } else {
+            Vec::new()
         };
-        if let Err(error) = catalog.merge_into(&mut tools, &profile, &provider, cx) {
-            return Task::ready(Err(error));
-        }
         let context = prepare_runtime_context(
             project.clone(),
             fs,
             Some(profile),
-            tools.keys().cloned().collect(),
-            Some(model.name().0.to_string()),
+            tool_names,
+            model.map(|model| model.name().0.to_string()),
             cx,
         );
         let store = match self.store(cx) {
@@ -252,7 +277,7 @@ impl NativeRuntimeConnection {
         cx.spawn(async move |cx| {
             let prepared = context.await?;
             let available_skills = Arc::new(prepared.skills.clone());
-            let mut configuration = prepared.configuration(Some(pinned_model));
+            let mut configuration = prepared.configuration(pinned_model);
             let services = if let Some(repository) = repository.await? {
                 let preparation = cx.update(|cx| {
                     if !cx.has_global::<RuntimeServicesCache>() {
@@ -305,6 +330,7 @@ impl NativeRuntimeConnection {
             let runtime_profile = profile.clone();
             let original_project = project.clone();
             let resolver_registry = registry.clone();
+            let has_provider = provider.is_some();
             let resolver: RuntimeToolResolver = Rc::new(move |job, _snapshot, cx| {
                 let requested_profile = job
                     .payload
@@ -325,7 +351,8 @@ impl NativeRuntimeConnection {
                     .map(|(provider, _)| {
                         language_model::LanguageModelProviderId(provider.to_owned().into())
                     })
-                    .unwrap_or_else(|| provider.clone());
+                    .or_else(|| provider.clone())
+                    .context("select a model before running agent tools")?;
                 let project = resolver_registry.read(cx).project_for(job, cx)?;
                 let actions = resolver_registry.read(cx).code_actions_for(job);
                 let action_log = resolver_registry.read(cx).action_log_for(job);
@@ -370,6 +397,9 @@ impl NativeRuntimeConnection {
             let loader_services = services.clone();
             let resolver = with_runtime_orchestration(resolver, runtime_profile, services, sink);
             let definitions = cx.update(|cx| {
+                if !has_provider {
+                    return Ok(Vec::new());
+                }
                 let job = agent_runtime::Job {
                     id: "catalog".into(),
                     agent_id: id.clone(),
@@ -497,7 +527,7 @@ impl NativeRuntimeConnection {
                 cx.update(|cx| {
                     if let Some(control) = connection.config_controls.borrow().get(&id).and_then(std::rc::Weak::upgrade) {
                         let configuration = connection.configurations.borrow().get(&id).cloned().unwrap_or_default();
-                        control.replace_options(runtime_model_options(&configuration, cx)?);
+                        control.replace_options(runtime_model_options(&configuration, cx).unwrap_or_default());
                     }
                     connection.legacy.0.update(cx, |agent, _| agent.models.notify_model_selection_changed());
                     if changed_model.is_some() || changed_profile.is_some() {
@@ -792,6 +822,11 @@ impl AgentConnection for NativeRuntimeConnection {
         let Some((view, position, usage)) = projection else {
             return Task::ready(Err(anyhow::anyhow!("conversation projection is detached")));
         };
+        if let Some(configuration) = self.configurations.borrow().get(&id)
+            && let Err(error) = configured_model(configuration, cx)
+        {
+            return Task::ready(Err(error.context(crate::NoModelConfiguredError)));
+        }
         let content = view
             .read_with(cx, |thread, cx| {
                 params
@@ -959,7 +994,7 @@ impl AgentConnection for NativeRuntimeConnection {
             .get(&id)
             .cloned()
             .unwrap_or_default();
-        let options = runtime_model_options(&configuration, cx).ok()?;
+        let options = runtime_model_options(&configuration, cx).unwrap_or_default();
         let connection = self.clone();
         let control_id = id.clone();
         let control = Rc::new(RuntimeSessionConfigOptions::new(
@@ -1083,12 +1118,10 @@ fn runtime_model_options(
                 )
             })
             .collect::<Vec<_>>();
-        options.push(acp_v2::SessionConfigOption::select(
-            "effort",
-            "Reasoning effort",
-            current,
-            choices,
-        ));
+        options.push(
+            acp_v2::SessionConfigOption::select("effort", "Reasoning effort", current, choices)
+                .category(acp_v2::SessionConfigOptionCategory::ThoughtLevel),
+        );
     }
     if model.supports_fast_mode() {
         options.push(acp_v2::SessionConfigOption::boolean(
@@ -1133,19 +1166,21 @@ impl AgentModelSelector for RuntimeModelSelector {
             Err(error) => return Task::ready(Err(error)),
         };
         let id = self.id.clone();
+        let config_controls = self.connection.config_controls.clone();
         cx.spawn(async move |cx| {
             let configuration: NativeRuntimeConfig =
-                serde_json::from_value(store.metadata(id).await?)?;
+                serde_json::from_value(store.metadata(id.clone()).await?)?;
             cx.update(|cx| {
-                let model = match configuration.model {
-                    Some(selection) => crate::native_runtime::resolve_model_id(
-                        &format!("{}/{}", selection.provider.0, selection.model),
-                        cx,
-                    )?,
-                    None => LanguageModelRegistry::read_global(cx)
-                        .default_model()
-                        .context("no model selected")?,
-                };
+                if let Some(control) = config_controls
+                    .borrow()
+                    .get(&id)
+                    .and_then(std::rc::Weak::upgrade)
+                {
+                    control.replace_options(
+                        runtime_model_options(&configuration, cx).unwrap_or_default(),
+                    );
+                }
+                let model = configured_model(&configuration, cx)?;
                 let provider = LanguageModelRegistry::read_global(cx).provider_for_model(&model)?;
                 Ok(crate::LanguageModels::map_language_model_to_info(
                     &model, &provider,
@@ -1500,6 +1535,116 @@ mod tests {
             // These workers run on OS threads, outside the simulated GPUI clock.
             async_io::Timer::after(Duration::from_millis(2)).await;
         }
+    }
+
+    #[gpui::test]
+    async fn runtime_session_recovers_unavailable_model(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let provider = crate::tests::init_test(cx);
+        let model = provider.model("fake");
+        let mut unavailable = language_model_to_selection(&model, None);
+        unavailable.model = "removed-from-catalog".into();
+        cx.update(|cx| {
+            settings::SettingsStore::update_global(cx, |store, cx| {
+                store
+                    .set_user_settings(
+                        &json!({"agent": {"default_model": unavailable}}).to_string(),
+                        cx,
+                    )
+                    .result()
+                    .expect("test settings should parse");
+            });
+        });
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let directory = tempfile::tempdir().expect("directory");
+        let host = cx.update(|cx| NativeRuntime::global(cx).expect("host"));
+        let runtime = host
+            .update(cx, |host, cx| {
+                host.start_database(
+                    directory.path().join("runtime.sqlite"),
+                    agent_runtime::RuntimeLimits::default(),
+                    cx,
+                )
+            })
+            .await
+            .expect("runtime");
+        let connection = cx.update(|cx| {
+            let thread_store = cx.new(crate::ThreadStore::new);
+            let legacy = NativeAgentConnection(crate::NativeAgent::new(
+                thread_store,
+                crate::Templates::new(),
+                fs.clone(),
+                cx,
+            ));
+            Rc::new(NativeRuntimeConnection::new(legacy, host, fs))
+        });
+        let work_dirs = PathList::new::<&std::path::Path>(&[]);
+        let thread = cx
+            .update(|cx| {
+                connection
+                    .clone()
+                    .new_session(project.clone(), work_dirs.clone(), cx)
+            })
+            .await
+            .expect("open a conversation with an unavailable model");
+        let session = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let id = runtime_id(&session).expect("runtime session").to_owned();
+        drop(thread);
+        let reopened = cx
+            .update(|cx| {
+                connection
+                    .clone()
+                    .load_session(session.clone(), project, work_dirs, None, cx)
+            })
+            .await
+            .expect("reopen the conversation with its saved model");
+        let selector = connection.model_selector(&session).expect("model picker");
+        assert!(cx.update(|cx| selector.selected_model(cx)).await.is_err());
+        assert!(cx.update(|cx| selector.list_models(cx)).await.is_ok());
+
+        let prompt = || acp_v2::PromptRequest::new(session.clone(), vec!["Hello".into()]);
+        let error = cx
+            .update(|cx| connection.prompt(prompt(), cx))
+            .await
+            .expect_err("the unavailable selection must block inference");
+        assert!(error.is::<crate::NoModelConfiguredError>());
+        assert_eq!(
+            runtime
+                .store
+                .snapshot(id.clone())
+                .await
+                .expect("agent")
+                .state,
+            "waiting"
+        );
+        assert!(provider.pending_completions_for(&model).is_empty());
+
+        cx.update(|cx| {
+            selector.select_model(
+                AgentModelId::from(format!("{}/{}", model.provider_id().0, model.id().0)),
+                cx,
+            )
+        })
+        .await
+        .expect("select a model from the live catalog");
+        let execution = cx.update(|cx| connection.prompt(prompt(), cx));
+        wait_until(|| !provider.pending_completions_for(&model).is_empty()).await;
+        let request = provider.pending_completions_for(&model).remove(0);
+        provider.send_text(&model, &request, "Hello from the runtime.");
+        provider.send_event(
+            &model,
+            &request,
+            LanguageModelCompletionEvent::Stop(StopReason::EndTurn),
+        );
+        provider.end_stream(&model, &request);
+        execution
+            .await
+            .expect("completion in the recovered conversation");
+        assert_eq!(
+            reopened.read_with(cx, |thread, _| thread.session_id().clone()),
+            session
+        );
     }
 
     #[gpui::test]
