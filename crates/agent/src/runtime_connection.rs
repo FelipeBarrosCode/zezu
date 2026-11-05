@@ -186,8 +186,7 @@ impl NativeRuntimeConnection {
         let selected = configuration
             .model
             .as_ref()
-            .or_else(|| settings.profiles.get(&profile)?.default_model.as_ref())
-            .or(settings.default_model.as_ref());
+            .or_else(|| settings.profiles.get(&profile)?.default_model.as_ref());
         let model = match selected {
             Some(selection) => crate::native_runtime::resolve_model_id(
                 &format!("{}/{}", selection.provider.0, selection.model),
@@ -196,6 +195,20 @@ impl NativeRuntimeConnection {
             .ok(),
             None => LanguageModelRegistry::read_global(cx).default_model(),
         };
+        let selected = selected.or_else(|| match &model {
+            Some(model) => settings.default_model.as_ref().filter(|selection| {
+                selection.provider.0 == model.provider_id().0.as_ref()
+                    && selection.model == model.id().0.as_ref()
+            }),
+            None => cx
+                .global::<settings::SettingsStore>()
+                .raw_user_settings()?
+                .content
+                .agent
+                .as_ref()?
+                .default_model
+                .as_ref(),
+        });
         // A provider can populate its catalog after the conversation opens. Keep the
         // requested selection so the picker can recover without changing models implicitly.
         let pinned_model = model
@@ -1575,6 +1588,9 @@ mod tests {
                     )
                     .result()
                     .expect("test settings should parse");
+            });
+            LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
+                registry.set_default_model(None, cx);
             });
         });
         let fs = FakeFs::new(cx.executor());
