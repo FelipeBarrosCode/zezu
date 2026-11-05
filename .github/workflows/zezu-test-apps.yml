@@ -2,7 +2,6 @@ name: Zezu test apps
 on:
   push:
     branches: [codex/test-app-builds]
-    paths: [.github/workflows/zezu-test-apps.yml]
   workflow_dispatch:
 permissions:
   contents: read
