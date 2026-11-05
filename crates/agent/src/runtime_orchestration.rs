@@ -91,6 +91,10 @@ pub fn prepare_runtime_orchestration(
 
 pub fn append_runtime_instructions(prompt: &mut String, services: &RuntimeOrchestrationServices) {
     prompt.push_str("\nNative runtime coordination: delegate with runtime_spawn, park dependencies with runtime_wait, and inspect results with runtime_reports. A child ending its turn with no pending effects automatically reports its final text. Use runtime_report for explicit structured success or failure. Never use legacy spawn_agent/create_thread execution paths.\n");
+    prompt.push_str(&format!(
+        "Save each runtime_spawn result's agent_id. Wait for those results before calling runtime_wait, then pass those exact agent_id values as dependencies. Spawn keys and labels are not agent IDs. Use at most {} tool calls in a model response and split larger batches across responses. Each wait accepts up to 256 dependency IDs.\n",
+        services.store.limits().max_tool_calls_per_response(),
+    ));
     if services.workspace.is_some() {
         prompt.push_str("Before modifying project files, acquire your editing lease with runtime_workspace_acquire. All editing and terminal operations must target that leased project. Preserve the lease response for checkpoint and release. Checkpoint edits with runtime_workspace_checkpoint, then release a clean workspace with runtime_workspace_release. Do not create or delete worktrees manually.\n");
     }

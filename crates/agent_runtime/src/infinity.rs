@@ -818,7 +818,7 @@ impl InfinitySlice {
             provider: self.provider.clone(),
             complete: complete.clone(),
             failure: failure.clone(),
-            maximum_tool_calls: store.limits().max_inputs_per_slice.min(256),
+            maximum_tool_calls: store.limits().max_tool_calls_per_response(),
         });
         let backend = SqliteInfinityStore {
             store: store.clone(),
