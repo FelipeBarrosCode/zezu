@@ -807,17 +807,29 @@ impl AgentConnection for NativeRuntimeConnection {
         if let Err(error) = self.validate_prompt_content(&params.prompt) {
             return Task::ready(Err(error));
         }
+        // ACP calls this method during a thread update. Access its projection
+        // inside the returned task, once that update has finished.
         if params.prompt.first().is_some_and(|block| matches!(block, acp_v2::ContentBlock::Text(text) if text.text.trim_start().split_whitespace().next() == Some("/compact"))) {
             let card_id = acp_thread::ContextCompactionId(uuid::Uuid::new_v4().to_string().into());
             let view = self.views.borrow().get(&id).map(|projection| projection.view.clone());
-            if let Some(view) = &view {
-                view.update(cx, |thread, cx| thread.push_context_compaction(acp_thread::ContextCompaction {
-                    id: card_id.clone(), status: acp_thread::ContextCompactionStatus::InProgress,
-                    error: None, summary: acp_thread::MessageContent::default(), meta: None,
-                }, cx)).log_err();
-            }
-            let task = self.host.update(cx, |host, cx| host.compact(id, cx));
+            let host = self.host.clone();
             return cx.spawn(async move |cx| {
+                if let Some(view) = &view {
+                    view.update(cx, |thread, cx| {
+                        thread.push_context_compaction(
+                            acp_thread::ContextCompaction {
+                                id: card_id.clone(),
+                                status: acp_thread::ContextCompactionStatus::InProgress,
+                                error: None,
+                                summary: acp_thread::MessageContent::default(),
+                                meta: None,
+                            },
+                            cx,
+                        )
+                    })
+                    .log_err();
+                }
+                let task = host.update(cx, |host, cx| host.compact(id, cx));
                 let result = task.await;
                 if let Some(view) = view {
                     let status = if result.is_ok() { acp_thread::ContextCompactionStatus::Completed } else { acp_thread::ContextCompactionStatus::Failed };
@@ -846,46 +858,36 @@ impl AgentConnection for NativeRuntimeConnection {
             return Task::ready(Err(anyhow::anyhow!("conversation projection is detached")));
         };
         let model_check = self.validate_prompt_model(&params.session_id, cx);
-        let content = view
-            .read_with(cx, |thread, cx| {
-                params
-                    .prompt
-                    .into_iter()
-                    .map(|block| {
-                        UserMessageContent::from_content_block(
-                            block,
-                            thread.project().read(cx).path_style(cx),
-                        )
-                    })
-                    .collect::<Result<Vec<_>>>()
-            })
-            .and_then(|result| result);
-        let mut content = match content {
-            Ok(content) => content,
-            Err(error) => return Task::ready(Err(error)),
-        };
-        let skill_name = content.first().and_then(|content| match content {
-            UserMessageContent::Text(text) => text
-                .trim_start()
-                .strip_prefix('/')
-                .and_then(|command| command.split_whitespace().next()),
-            _ => None,
-        });
-        let skill = skill_name.and_then(|name| {
-            self.skills
-                .borrow()
-                .get(&id)
-                .and_then(|skills| skills.iter().find(|skill| skill.name == name).cloned())
-        });
-        let project = match view.read_with(cx, |thread, _| thread.project().clone()) {
-            Ok(project) => project,
-            Err(error) => return Task::ready(Err(error)),
-        };
-        let read_skill = crate::skill_body_resolver_for_project(project, self.fs.clone());
+        let skills = self.skills.clone();
+        let fs = self.fs.clone();
         cx.spawn(async move |cx| {
             model_check.await?;
             ensure_no_uncertain_tools(&store, &id).await?;
+            let (project, path_style) = view.read_with(cx, |thread, cx| {
+                let project = thread.project().clone();
+                let path_style = project.read(cx).path_style(cx);
+                (project, path_style)
+            })?;
+            let mut content = params
+                .prompt
+                .into_iter()
+                .map(|block| UserMessageContent::from_content_block(block, path_style))
+                .collect::<Result<Vec<_>>>()?;
+            let skill_name = content.first().and_then(|content| match content {
+                UserMessageContent::Text(text) => text
+                    .trim_start()
+                    .strip_prefix('/')
+                    .and_then(|command| command.split_whitespace().next()),
+                _ => None,
+            });
+            let skill = skill_name.and_then(|name| {
+                skills
+                    .borrow()
+                    .get(&id)
+                    .and_then(|skills| skills.iter().find(|skill| skill.name == name).cloned())
+            });
             if let Some(skill) = skill {
+                let read_skill = crate::skill_body_resolver_for_project(project, fs);
                 let body = match skill.embedded_body { Some(body) => body.to_owned(), None => read_skill(skill.clone(), cx).await? };
                 let envelope = crate::tools::render_skill_envelope(&skill, &body);
                 if let Some(UserMessageContent::Text(text)) = content.first_mut() { *text = crate::strip_slash_command_prefix(text); }
@@ -1540,7 +1542,7 @@ pub(crate) fn project_runtime_tool_event(
 mod tests {
     use super::*;
     use fs::FakeFs;
-    use gpui::TestAppContext;
+    use gpui::{TestAppContext, UpdateGlobal as _};
     use language_model::{
         LanguageModelCompletionEvent, LanguageModelToolUse, LanguageModelToolUseInput, StopReason,
     };
@@ -1644,6 +1646,14 @@ mod tests {
         );
         assert!(provider.pending_completions_for(&model).is_empty());
 
+        let compaction_error = reopened
+            .update(cx, |thread, cx| {
+                thread.send_command(vec!["/compact".into()], cx)
+            })
+            .await
+            .expect_err("compaction should report the unavailable model");
+        assert!(format!("{compaction_error:#}").contains("removed-from-catalog"));
+
         cx.update(|cx| {
             selector.select_model(
                 AgentModelId::from(format!("{}/{}", model.provider_id().0, model.id().0)),
@@ -1652,7 +1662,7 @@ mod tests {
         })
         .await
         .expect("select a model from the live catalog");
-        let execution = cx.update(|cx| reopened_connection.prompt(prompt(), cx));
+        let execution = reopened.update(cx, |thread, cx| thread.send(vec!["Hello".into()], cx));
         wait_until(|| !provider.pending_completions_for(&model).is_empty()).await;
         let request = provider.pending_completions_for(&model).remove(0);
         provider.send_text(&model, &request, "Hello from the runtime.");
@@ -1750,14 +1760,8 @@ mod tests {
                 .0
                 .read_with(cx, |legacy, _| legacy.sessions.is_empty())
         );
-        let execution = cx.update(|cx| {
-            connection.prompt(
-                acp_v2::PromptRequest::new(
-                    session.clone(),
-                    vec!["Read the external linked file.".into()],
-                ),
-                cx,
-            )
+        let execution = thread.update(cx, |thread, cx| {
+            thread.send(vec!["Read the external linked file.".into()], cx)
         });
         wait_until(|| !provider.pending_completions_for(&model).is_empty()).await;
         let request = provider
