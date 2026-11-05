@@ -1540,7 +1540,7 @@ pub(crate) fn project_runtime_tool_event(
 mod tests {
     use super::*;
     use fs::FakeFs;
-    use gpui::TestAppContext;
+    use gpui::{TestAppContext, UpdateGlobal as _};
     use language_model::{
         LanguageModelCompletionEvent, LanguageModelToolUse, LanguageModelToolUseInput, StopReason,
     };
