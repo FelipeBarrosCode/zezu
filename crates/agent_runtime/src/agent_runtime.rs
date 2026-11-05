@@ -56,6 +56,10 @@ impl Default for RuntimeLimits {
 }
 
 impl RuntimeLimits {
+    pub fn max_tool_calls_per_response(&self) -> usize {
+        self.max_inputs_per_slice.min(model::MAX_TOOL_CALLS)
+    }
+
     pub fn validate(&self) -> Result<()> {
         ensure!(self.max_agents_per_run > 0, "agent limit must be positive");
         ensure!(self.max_active_agents > 0, "active limit must be positive");

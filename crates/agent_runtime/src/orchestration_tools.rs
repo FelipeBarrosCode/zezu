@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use crate::{
     Job, RuntimeStore,
-    orchestration::{FailurePolicy, Orchestrator, TaskIdentity, TaskResult},
+    orchestration::{FailurePolicy, InvalidWait, Orchestrator, TaskIdentity, TaskResult},
     workspaces::{WorkspaceLease, WorkspacePool},
 };
 
@@ -33,14 +33,14 @@ pub fn definitions(workspaces: bool) -> Vec<ToolDefinition> {
     let mut tools = vec![
         definition(
             "runtime_spawn",
-            "Delegate an isolated child task. Its initial prompt and instructions are durable. Use runtime_wait to join children and runtime_reports to inspect results.",
+            "Delegate an isolated child task with a durable initial prompt. Save the returned agent_id for runtime_wait and runtime_reports. The spawn key is a label, not the agent ID.",
             json!({"key":{"type":"string"},"prompt":{"type":"string"},"fresh":{"type":"boolean"}}),
             &["key", "prompt"],
         ),
         definition(
             "runtime_wait",
-            "Park this agent until its dependencies report. This releases inference capacity. Set fail_fast to wake on the first failure.",
-            json!({"key":{"type":"string"},"dependencies":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":256},"fail_fast":{"type":"boolean"}}),
+            "Park this agent until its dependencies report. Wait for the runtime_spawn results first, then pass their returned agent_id values as dependencies. Set fail_fast to wake on the first failure.",
+            json!({"key":{"type":"string"},"dependencies":{"type":"array","items":{"type":"string","description":"Returned agent_id of a task in this run. Do not pass a spawn key or label."},"minItems":1,"maxItems":256},"fail_fast":{"type":"boolean"}}),
             &["key", "dependencies"],
         ),
         definition(
@@ -221,21 +221,36 @@ pub async fn dispatch_runtime_job_with_integration(
                 #[serde(default)]
                 fail_fast: bool,
             }
-            let arguments: Arguments = serde_json::from_value(arguments)?;
-            serde_json::to_value(
-                orchestrator
-                    .wait_for(
-                        task,
-                        arguments.key,
-                        arguments.dependencies,
-                        if arguments.fail_fast {
-                            FailurePolicy::FailFast
-                        } else {
-                            FailurePolicy::Collect
-                        },
+            let arguments: Arguments = match serde_json::from_value(arguments) {
+                Ok(arguments) => arguments,
+                Err(_) => {
+                    return reject_wait(
+                        &store,
+                        job,
+                        "runtime_wait requires a string key, a dependencies array of agent_id strings, and an optional boolean fail_fast",
                     )
-                    .await?,
-            )?
+                    .await;
+                }
+            };
+            let status = orchestrator
+                .wait_for(
+                    task,
+                    arguments.key,
+                    arguments.dependencies,
+                    if arguments.fail_fast {
+                        FailurePolicy::FailFast
+                    } else {
+                        FailurePolicy::Collect
+                    },
+                )
+                .await;
+            match status {
+                Ok(status) => serde_json::to_value(status)?,
+                Err(error) if error.is::<InvalidWait>() => {
+                    return reject_wait(&store, job, &error.to_string()).await;
+                }
+                Err(error) => return Err(error),
+            }
         }
         "runtime_reports" => {
             #[derive(Deserialize)]
@@ -417,6 +432,18 @@ pub async fn dispatch_runtime_job_with_integration(
     Ok(true)
 }
 
+async fn reject_wait(store: &RuntimeStore, job: Job, message: &str) -> Result<bool> {
+    store
+        .complete_tool_job(
+            job,
+            vec![json!({"type":"text","text":message})],
+            true,
+            Value::Null,
+        )
+        .await?;
+    Ok(true)
+}
+
 fn ensure_owner(lease: &WorkspaceLease, job: &Job) -> Result<()> {
     ensure!(
         lease.agent_id == job.agent_id && lease.generation == job.generation,
@@ -456,7 +483,118 @@ pub(crate) fn tool_result_input(job: &Job, result: Value, is_error: bool) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{RuntimeLimits, SliceOutcome};
+    use crate::{JobState, RuntimeLimits, SliceOutcome};
+
+    #[tokio::test]
+    async fn invalid_wait_returns_tool_error_then_accepts_the_completed_child_id() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let store = RuntimeStore::open(
+            directory.path().join("runtime.sqlite"),
+            RuntimeLimits::default(),
+        )?;
+        let orchestrator = Orchestrator::open(store.clone()).await?;
+        store.create_root("root".into(), json!({})).await?;
+        let parent = TaskIdentity {
+            agent_id: "root".into(),
+            generation: 0,
+        };
+        let child = orchestrator
+            .spawn_child(parent, "agent-01".into(), 0, true)
+            .await?;
+        orchestrator
+            .report(
+                TaskIdentity {
+                    agent_id: child.clone(),
+                    generation: 0,
+                },
+                "done".into(),
+                TaskResult::Success(json!("completed child")),
+            )
+            .await?;
+        assert_eq!(store.snapshot(child.clone()).await?.state, "completed");
+
+        store
+            .enqueue_text_input("root".into(), "start".into(), "collect results".into())
+            .await?;
+        let lease = store.admit().await?.context("parent admission")?;
+        let invalid_waits = [
+            ("label", json!([child, "agent-01"])),
+            ("malformed", json!("agent-01")),
+        ];
+        for (id, dependencies) in &invalid_waits {
+            store
+                .record_job(
+                    lease.clone(),
+                    (*id).into(),
+                    json!({
+                        "tool": "runtime_wait",
+                        "tool_call_id": id,
+                        "provider_call_id": format!("provider-{id}"),
+                        "arguments": {"key":"join", "dependencies":dependencies},
+                    }),
+                )
+                .await?;
+        }
+        store
+            .finish(lease, json!({}), SliceOutcome::Waiting)
+            .await?;
+        for (id, _) in invalid_waits {
+            let job = store.dispatch_job(id.into()).await?;
+            assert!(dispatch_runtime_job(store.clone(), job, None).await?);
+            let job = store.job(id.into()).await?;
+            assert_eq!(job.state, JobState::Completed);
+            let result = job.result.context("completed tool error")?;
+            assert_eq!(result["content"]["is_error"], true);
+            assert_eq!(result["content"]["id"], id);
+            assert_eq!(result["content"]["call_id"], format!("provider-{id}"));
+            assert!(
+                result["content"]["content"][0]["text"]
+                    .as_str()
+                    .context("error text")?
+                    .contains("agent_id")
+            );
+        }
+        assert!(store.uncertain_jobs("root".into(), 1).await?.is_empty());
+        let lease = store
+            .admit()
+            .await?
+            .context("parent resumes after tool errors")?;
+        assert_eq!(lease.inputs.len(), 2);
+        assert_eq!(lease.agent_id, "root");
+        store
+            .record_job(
+                lease.clone(),
+                "valid".into(),
+                json!({
+                    "tool":"runtime_wait",
+                    "tool_call_id":"valid",
+                    "arguments":{"key":"join", "dependencies":[child]},
+                }),
+            )
+            .await?;
+        store
+            .finish(lease, json!({}), SliceOutcome::Waiting)
+            .await?;
+
+        let job = store.dispatch_job("valid".into()).await?;
+        assert!(dispatch_runtime_job(store.clone(), job, None).await?);
+        let lease = store
+            .admit()
+            .await?
+            .context("parent resumes with the child report")?;
+        assert_eq!(lease.inputs.len(), 2);
+        assert_eq!(lease.inputs[0].0, "job:valid:result");
+        assert!(lease.inputs[1].0.starts_with("join:"));
+        let report: Value = serde_json::from_str(
+            lease.inputs[1].1["content"]["text"]
+                .as_str()
+                .context("join report text")?,
+        )?;
+        assert_eq!(report["remaining"], 0);
+        assert_eq!(report["results"][0]["agent_id"], child);
+        assert_eq!(report["results"][0]["result"]["result"], "completed child");
+        store.shutdown().await
+    }
 
     #[tokio::test]
     async fn native_spawn_and_terminal_report_drive_parent_join() -> Result<()> {

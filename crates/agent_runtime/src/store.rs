@@ -362,7 +362,10 @@ impl RuntimeStore {
             transaction.execute("UPDATE runs SET last_admitted=? WHERE id=?", params![clock,root_id])?;
             transaction.execute("UPDATE agents SET state='running',lease_id=?,last_admitted=? WHERE id=?", params![lease_id,clock,agent_id])?;
             let mut inputs: Vec<(String, String)> = {
-                let mut statement = transaction.prepare("SELECT message_id,payload FROM inbox WHERE agent_id=? AND processed=0 ORDER BY sequence LIMIT ?")?;
+                // User and join-ready inputs interrupt unanswered calls in Infinity.
+                // Deliver the pending tool results before these inputs, even when a join
+                // became ready before its runtime_wait job recorded its result.
+                let mut statement = transaction.prepare("SELECT message_id,payload FROM inbox WHERE agent_id=? AND processed=0 ORDER BY message_id NOT GLOB 'job:*:result', sequence LIMIT ?")?;
                 statement.query_map(params![agent_id,input_limit], |row| Ok((row.get(0)?,row.get(1)?)))?.collect::<rusqlite::Result<_>>()?
             };
             crate::input_batches::preserve_boundary(&transaction, &agent_id, &mut inputs)?;
