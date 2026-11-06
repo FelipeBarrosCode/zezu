@@ -6,7 +6,10 @@ use agent_runtime::{
 };
 use anyhow::{Context as _, Result, ensure};
 use gpui::{App, AppContext as _, Context, Entity, EntityId, Global, Task, WeakEntity};
-use project::{LocalProjectFlags, Project, trusted_worktrees::TrustedWorktrees};
+use project::{
+    LocalProjectFlags, Project,
+    trusted_worktrees::{TrustedWorktrees, TrustedWorktreesEvent},
+};
 
 use crate::{runtime_mcp::RuntimeMcpCatalog, runtime_project::RuntimeCodeActions};
 
@@ -53,13 +56,26 @@ impl RuntimeWorkspaceProjects {
         let original_actions = RuntimeCodeActions::new(128, 1024 * 1024)?;
         let original_mcp = RuntimeMcpCatalog::new(original.clone(), cx);
         let original_action_log = cx.new(|_| ActionLog::new(original.clone()));
-        let registry = cx.new(|_| Self {
-            original,
-            original_actions,
-            original_action_log,
-            original_mcp,
-            maximum,
-            workspaces: BTreeMap::new(),
+        let source_store = original.read(cx).worktree_store().downgrade();
+        let registry = cx.new(|cx: &mut Context<Self>| {
+            if let Some(trust) = TrustedWorktrees::try_get_global(cx) {
+                cx.subscribe(&trust, move |registry, _, event, _| {
+                    if let TrustedWorktreesEvent::Restricted(store, _) = event
+                        && *store == source_store
+                    {
+                        registry.workspaces.clear();
+                    }
+                })
+                .detach();
+            }
+            Self {
+                original,
+                original_actions,
+                original_action_log,
+                original_mcp,
+                maximum,
+                workspaces: BTreeMap::new(),
+            }
         });
         if cx.try_global::<SharedWorkspaceProjects>().is_none() {
             cx.set_global(SharedWorkspaceProjects::default());
@@ -166,6 +182,13 @@ impl RuntimeWorkspaceProjects {
                     },
                     cx,
                 );
+                if let Some(trusted_worktrees) = TrustedWorktrees::try_get_global(cx) {
+                    let source = registry.original.read(cx).worktree_store();
+                    let derived = project.read(cx).worktree_store();
+                    trusted_worktrees.update(cx, |store, cx| {
+                        store.inherit_local_worktree_trust(&derived, &source, &lease.path, cx)
+                    })?;
+                }
                 let actions = RuntimeCodeActions::new(128, 1024 * 1024)?;
                 let mcp = RuntimeMcpCatalog::new(project.clone(), cx);
                 let action_log = cx.new(|_| ActionLog::new(project.clone()));
@@ -282,7 +305,7 @@ impl RuntimeWorkspaceProjects {
     }
 }
 
-fn requires_workspace(tool: &str) -> bool {
+pub(crate) fn requires_workspace(tool: &str) -> bool {
     matches!(
         tool,
         "edit_file"
@@ -320,6 +343,7 @@ mod tests {
         for tool in [
             "read_file",
             "grep",
+            "runtime_workspace_preflight",
             "runtime_workspace_acquire",
             "runtime_workspace_checkpoint",
             "runtime_workspace_release",
@@ -332,9 +356,10 @@ mod tests {
     #[gpui::test]
     async fn leased_project_edits_stay_out_of_the_original_project(cx: &mut gpui::TestAppContext) {
         use agent_runtime::{JobState, RuntimeLimits, workspaces::WorkspacePool};
-        use project::ProjectPath;
+        use project::{ProjectPath, trusted_worktrees::PathTrust};
         cx.executor().allow_parking();
         crate::tests::init_test(cx);
+        cx.update(|cx| project::trusted_worktrees::init(Default::default(), cx));
         let directory = tempfile::tempdir().expect("directory");
         let repository = directory.path().join("repository");
         std::fs::create_dir(&repository).expect("repository");
@@ -365,6 +390,24 @@ mod tests {
                 async move |mut cx| Project::example([repository.as_path()], &mut cx).await
             })
             .await;
+        let source_store = original.read_with(cx, |project, _| project.worktree_store());
+        let source_id = source_store.read_with(cx, |store, cx| {
+            store
+                .visible_worktrees(cx)
+                .next()
+                .expect("source worktree")
+                .read(cx)
+                .id()
+        });
+        let trust = cx.read(|cx| TrustedWorktrees::try_get_global(cx).expect("worktree trust"));
+        trust.update(cx, |trust, cx| {
+            assert!(!trust.can_trust(&source_store, source_id, cx));
+            trust.trust(
+                &source_store,
+                [PathTrust::Worktree(source_id)].into_iter().collect(),
+                cx,
+            );
+        });
         let store = RuntimeStore::open(
             directory.path().join("runtime.sqlite"),
             RuntimeLimits::default(),
@@ -418,6 +461,20 @@ mod tests {
             registry.project_for(&job, cx).expect("isolated project")
         });
         assert_ne!(isolated.entity_id(), original.entity_id());
+        let isolated_store = isolated.read_with(cx, |project, _| project.worktree_store());
+        cx.read(|cx| {
+            assert!(
+                isolated_store
+                    .read(cx)
+                    .visible_worktrees(cx)
+                    .next()
+                    .is_some()
+            );
+            assert!(!TrustedWorktrees::has_restricted_worktrees(
+                &isolated_store,
+                cx
+            ));
+        });
         let path = isolated.read_with(cx, |project, cx| ProjectPath {
             worktree_id: project
                 .worktrees(cx)
@@ -446,6 +503,33 @@ mod tests {
             std::fs::read_to_string(lease.path.join("code.txt")).expect("isolated file"),
             "isolated edit\n"
         );
+        trust.update(cx, |trust, cx| {
+            trust.restrict(
+                source_store.downgrade(),
+                [PathTrust::Worktree(source_id)].into_iter().collect(),
+                cx,
+            );
+        });
+        cx.read(|cx| {
+            assert!(TrustedWorktrees::has_restricted_worktrees(
+                &isolated_store,
+                cx
+            ));
+            assert!(registry.read(cx).project_for(&job, cx).is_err());
+        });
+        trust.update(cx, |trust, cx| {
+            trust.trust(
+                &source_store,
+                [PathTrust::Worktree(source_id)].into_iter().collect(),
+                cx,
+            );
+        });
+        cx.read(|cx| {
+            assert!(!TrustedWorktrees::has_restricted_worktrees(
+                &isolated_store,
+                cx
+            ));
+        });
         pool.checkpoint(lease.clone(), "checkpoint isolated edit".into())
             .await
             .expect("checkpoint");

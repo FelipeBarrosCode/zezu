@@ -884,17 +884,36 @@ pub async fn stream_response(
     request: Request,
     extra_headers: &CustomHeaders,
 ) -> Result<BoxStream<'static, Result<StreamEvent, RequestError>>, RequestError> {
+    let body = serde_json::to_string(&request).map_err(|e| RequestError::Other(e.into()))?;
+    stream_serialized_response(
+        client,
+        provider_name,
+        api_url,
+        api_key,
+        body,
+        request.stream,
+        extra_headers,
+    )
+    .await
+}
+
+pub async fn stream_serialized_response(
+    client: &dyn HttpClient,
+    provider_name: &str,
+    api_url: &str,
+    api_key: &str,
+    body: String,
+    is_streaming: bool,
+    extra_headers: &CustomHeaders,
+) -> Result<BoxStream<'static, Result<StreamEvent, RequestError>>, RequestError> {
     let uri = format!("{api_url}/responses");
-    let is_streaming = request.stream;
     let request = HttpRequest::builder()
         .method(Method::POST)
         .uri(uri)
         .header("Content-Type", "application/json")
         .header("Authorization", format!("Bearer {}", api_key.trim()))
         .extra_headers(extra_headers)
-        .body(AsyncBody::from(
-            serde_json::to_string(&request).map_err(|e| RequestError::Other(e.into()))?,
-        ))
+        .body(AsyncBody::from(body))
         .map_err(|e| RequestError::Other(e.into()))?;
 
     let host = request.uri().host().unwrap_or(api_url).to_owned();

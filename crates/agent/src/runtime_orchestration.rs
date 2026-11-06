@@ -7,7 +7,7 @@ use agent_runtime::{
         RuntimeIntegration, definitions_with_integration, dispatch_runtime_job_with_integration,
     },
     resource::RuntimeResources,
-    workspaces::WorkspacePool,
+    workspaces::{InvalidWorkspace, WorkspacePool},
 };
 use agent_settings::{AgentProfileId, AgentProfileSettings, AgentSettings};
 use anyhow::{Context as _, Result, ensure};
@@ -26,6 +26,7 @@ use crate::{
 pub struct RuntimeOrchestrationServices {
     pub store: RuntimeStore,
     pub workspace: Option<WorkspacePool>,
+    pub workspace_error: Option<String>,
     pub integration: Option<RuntimeIntegration>,
     _quit: Option<Rc<Subscription>>,
 }
@@ -35,6 +36,7 @@ impl RuntimeOrchestrationServices {
         Self {
             store,
             workspace: None,
+            workspace_error: None,
             integration: None,
             _quit: None,
         }
@@ -59,7 +61,17 @@ pub fn prepare_runtime_orchestration(
     let settings = AgentSettings::get_global(cx).runtime.clone();
     let capacity = resources.limits().max_workspaces;
     cx.spawn(async move |cx| {
-        let workspace=WorkspacePool::open(store.clone(),repository.clone(),pool_directory,capacity).await?.with_resources(resources);
+        let workspace = match WorkspacePool::open(store.clone(), repository.clone(), pool_directory, capacity).await {
+            Ok(workspace) => workspace.with_resources(resources),
+            Err(error) if error.is::<InvalidWorkspace>() => {
+                log::warn!("runtime editing workspace is unavailable: {error:#}");
+                return Ok(RuntimeOrchestrationServices {
+                    workspace_error: Some(error.to_string()),
+                    ..RuntimeOrchestrationServices::metadata_only(store)
+                });
+            }
+            Err(error) => return Err(error),
+        };
         let recovered=workspace.recover().await?;
         if !recovered.is_empty() {log::warn!("{} editing workspaces require explicit recovery",recovered.len());}
         let checks=settings.integration_checks.unwrap_or_default();
@@ -85,21 +97,36 @@ pub fn prepare_runtime_orchestration(
             if let Some(integration)=&integration_shutdown {integration.request_shutdown();}
             async {}
         }))));
-        Ok(RuntimeOrchestrationServices {store,workspace:Some(workspace),integration,_quit:quit})
+        Ok(RuntimeOrchestrationServices {store,workspace:Some(workspace),workspace_error:None,integration,_quit:quit})
     })
 }
 
 pub fn append_runtime_instructions(prompt: &mut String, services: &RuntimeOrchestrationServices) {
     prompt.push_str("\nNative runtime coordination: delegate with runtime_spawn, park dependencies with runtime_wait, and inspect results with runtime_reports. A child ending its turn with no pending effects automatically reports its final text. Use runtime_report for explicit structured success or failure. Never use legacy spawn_agent/create_thread execution paths.\n");
+    prompt.push_str(&format!(
+        "Save each runtime_spawn result's agent_id. Wait for those results before calling runtime_wait, then pass those exact agent_id values as dependencies. Spawn keys and labels are not agent IDs. Use at most {} tool calls in a model response and split larger batches across responses. Each wait accepts up to 256 dependency IDs.\n",
+        services.store.limits().max_tool_calls_per_response(),
+    ));
     if services.workspace.is_some() {
+        prompt.push_str("Use runtime_workspace_preflight to check the original repository root, HEAD, and whether a top-level target already exists. It does not require a lease. Terminal commands after acquisition run in the isolated checkout.\n");
         prompt.push_str("Before modifying project files, acquire your editing lease with runtime_workspace_acquire. All editing and terminal operations must target that leased project. Preserve the lease response for checkpoint and release. Checkpoint edits with runtime_workspace_checkpoint, then release a clean workspace with runtime_workspace_release. Do not create or delete worktrees manually.\n");
+        prompt.push_str("For delegated edits, ask each child to report its changed paths, checkpoint artifact ID, and any integration result. A successful edit saves to the leased checkout. A checkpoint saves a Git artifact. Verify successful integration into the intended branch before reporting that files landed in the original checkout.\n");
+    } else if let Some(error) = &services.workspace_error {
+        prompt.push_str(&format!(
+            "Editing workspaces are unavailable for this project. {error}\n"
+        ));
     }
-    if services
-        .integration
-        .as_ref()
-        .is_some_and(|policy| policy.auto_integrate)
-    {
-        prompt.push_str("When your profile permits integration, workspace checkpoints automatically run the user's configured checks and integrate into the configured target branch. Check commands and destination are application settings. Inspect the returned integration status; report failed checks or conflicts instead of bypassing them. runtime_revert selectively reverses an integration with validation.\n");
+    match &services.integration {
+        Some(policy) if policy.auto_integrate => {
+            prompt.push_str("When your profile permits integration, workspace checkpoints automatically run the user's configured checks and integrate into the configured target branch. Check commands and destination are application settings. Inspect the returned integration status; report failed checks or conflicts instead of bypassing them. runtime_revert selectively reverses an integration with validation.\n");
+        }
+        Some(_) => {
+            prompt.push_str("Use runtime_integrate with a checkpoint artifact ID to apply it through the configured checks when the task calls for publishing changes.\n");
+        }
+        None if services.workspace.is_some() => {
+            prompt.push_str("Publishing to the source checkout requires configured agent.runtime.integration_checks. Report checkpoint artifact IDs so the user can recover the saved changes.\n");
+        }
+        None => {}
     }
 }
 
@@ -111,6 +138,12 @@ pub fn runtime_tool_enabled(profile: &AgentProfileSettings, name: &str) -> bool 
         "runtime_spawn" | "runtime_wait" => profile.is_tool_enabled("spawn_agent"),
         "runtime_report" | "runtime_reports" => {
             profile.is_tool_enabled("read_file") || profile.is_tool_enabled("spawn_agent")
+        }
+        "runtime_workspace_preflight" => {
+            profile.is_tool_enabled("read_file")
+                || profile.is_tool_enabled("edit_file")
+                || profile.is_tool_enabled("write_file")
+                || profile.is_tool_enabled("spawn_agent")
         }
         "runtime_workspace_acquire"
         | "runtime_workspace_checkpoint"
@@ -151,6 +184,11 @@ pub fn with_runtime_orchestration(
         let mut context = resolver(job, snapshot, cx)?;
         context.tools.remove("spawn_agent");
         context.tools.remove("create_thread");
+        if services.workspace_error.is_some() {
+            context
+                .tools
+                .retain(|name, _| !crate::runtime_workspaces::requires_workspace(name));
+        }
         let requested_profile = authoritative_profile(job, &profile_id)?;
         let (effective_profile_id, _) =
             Thread::profile_for_restricted_workspace(requested_profile, &context.project, cx);
@@ -162,8 +200,12 @@ pub fn with_runtime_orchestration(
             &context.project.read(cx).worktree_store(),
             cx,
         );
+        let needs_workspace_diagnostic = matches!(
+            job.payload.get("tool").and_then(serde_json::Value::as_str),
+            Some("runtime_workspace_acquire" | "runtime_workspace_preflight")
+        );
         let definitions = definitions_with_integration(
-            services.workspace.is_some() && !restricted,
+            (services.workspace.is_some() || needs_workspace_diagnostic) && !restricted,
             services.integration.is_some() && !restricted,
         )
         .into_iter()
@@ -201,7 +243,9 @@ pub fn with_runtime_orchestration(
                         enabled.iter().any(|enabled| enabled == name),
                         "internal tool is disabled by the selected profile"
                     );
-                    if name.starts_with("runtime_workspace_")
+                    if (name.starts_with("runtime_workspace_")
+                        && name != "runtime_workspace_preflight"
+                        && services.workspace.is_some())
                         || matches!(name, "runtime_integrate" | "runtime_revert")
                     {
                         authorize_effect(
@@ -356,6 +400,7 @@ mod tests {
     fn readonly_mcp_profiles_can_use_leases_without_native_edit_or_integration() {
         let mut profile = readonly_profile();
         for tool in [
+            "runtime_workspace_preflight",
             "runtime_workspace_acquire",
             "runtime_workspace_checkpoint",
             "runtime_workspace_release",

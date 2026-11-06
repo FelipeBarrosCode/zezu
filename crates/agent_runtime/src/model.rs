@@ -23,7 +23,7 @@ use language_model_core::{
 use serde::{Deserialize, Serialize};
 
 const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
-const MAX_TOOL_CALLS: usize = 256;
+pub(crate) const MAX_TOOL_CALLS: usize = 256;
 const NATIVE_STATE_NAMESPACE: &str = "zed.language-model.v1";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -324,7 +324,7 @@ impl ModelProvider for ZedModelProvider {
     }
 }
 
-fn serialized_size(value: &impl Serialize) -> Result<usize> {
+pub(crate) fn serialized_size(value: &impl Serialize) -> Result<usize> {
     struct Counter(usize);
     impl std::io::Write for Counter {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {

@@ -50,6 +50,18 @@ pub struct JoinStatus {
     pub remaining: usize,
 }
 
+/// A wait request rejected before it can change the join or inbox.
+#[derive(Debug)]
+pub(crate) struct InvalidWait(&'static str);
+
+impl std::fmt::Display for InvalidWait {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for InvalidWait {}
+
 #[derive(Clone)]
 pub struct Orchestrator {
     store: RuntimeStore,
@@ -133,31 +145,34 @@ impl Orchestrator {
     ) -> Result<JoinStatus> {
         ensure!(
             !key.is_empty() && key.len() <= 256,
-            "join key must contain 1 to 256 bytes"
+            InvalidWait("join key must contain 1 to 256 bytes")
+        );
+        ensure!(
+            (1..=256).contains(&dependencies.len()),
+            InvalidWait("a join requires 1 to 256 dependency agent IDs")
         );
         dependencies.sort();
         dependencies.dedup();
-        ensure!(
-            !dependencies.is_empty() && dependencies.len() <= 256,
-            "a join requires 1 to 256 dependencies"
-        );
         self.store.write(move |connection| {
             let transaction = connection.transaction()?;
             let root = validate_identity(&transaction, &parent)?;
             if let Some(id) = transaction.query_row("SELECT id FROM runtime_joins WHERE agent_id=? AND generation=? AND join_key=?", params![parent.agent_id,parent.generation,key], |row| row.get::<_,String>(0)).optional()? {
                 let existing = dependency_ids(&transaction, &id)?;
                 let existing_policy: String = transaction.query_row("SELECT policy FROM runtime_joins WHERE id=?", [&id], |row| row.get(0))?;
-                ensure!(existing == dependencies && existing_policy == policy_name(policy), "join key reused with a different dependency set or policy");
+                ensure!(existing == dependencies && existing_policy == policy_name(policy), InvalidWait("join key reused with a different dependency set or policy"));
                 return join_status(&transaction, &id);
             }
             for dependency in &dependencies {
-                ensure!(dependency != &parent.agent_id, "a task cannot depend on itself");
-                let dependency_root: String = transaction.query_row("SELECT root_id FROM agents WHERE id=?", [dependency], |row| row.get(0))?;
-                ensure!(dependency_root == root, "dependencies cannot cross runs");
+                ensure!(dependency != &parent.agent_id, InvalidWait("a task cannot depend on itself"));
+                let dependency_root: Option<String> = transaction.query_row("SELECT root_id FROM agents WHERE id=?", [dependency], |row| row.get(0)).optional()?;
+                let dependency_root = dependency_root.ok_or(InvalidWait(
+                    "unknown dependency agent ID. Use the agent_id values returned by runtime_spawn, not the spawn keys or labels",
+                ))?;
+                ensure!(dependency_root == root, InvalidWait("dependencies cannot cross runs"));
                 let cycle: bool = transaction.query_row(
                     "WITH RECURSIVE reachable(id) AS (SELECT ? UNION SELECT d.agent_id FROM reachable r JOIN runtime_joins j ON j.agent_id=r.id AND j.state='pending' JOIN runtime_join_dependencies d ON d.join_id=j.id) SELECT EXISTS(SELECT 1 FROM reachable WHERE id=?)",
                     params![dependency,parent.agent_id], |row| row.get(0))?;
-                ensure!(!cycle, "dependency would create a cycle");
+                ensure!(!cycle, InvalidWait("dependency would create a cycle"));
             }
             let id = uuid::Uuid::new_v4().to_string();
             transaction.execute("INSERT INTO runtime_joins(id,agent_id,generation,join_key,policy) VALUES (?,?,?,?,?)", params![id,parent.agent_id,parent.generation,key,policy_name(policy)])?;

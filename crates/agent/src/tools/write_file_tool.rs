@@ -330,6 +330,55 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn runtime_write_reports_a_failed_save_and_keeps_the_dirty_buffer(
+        cx: &mut TestAppContext,
+    ) {
+        let (_legacy_tool, project, action_log, fs, _thread) =
+            setup_test(cx, json!({"file.txt": "old content"})).await;
+        let languages = project.read_with(cx, |project, _| project.languages().clone());
+        let tool = Arc::new(WriteFileTool::new_runtime(
+            project.clone(),
+            action_log,
+            languages,
+        ));
+        let path = "root/file.txt";
+        let content = "new content";
+        let (mut sender, input) = ToolInput::<WriteFileToolInput>::test();
+        let task = cx.update(|cx| tool.run(input, ToolCallEventStream::test().0, cx));
+        sender.send_partial(json!({"path": path}));
+        sender.send_partial(json!({"path": path, "content": content}));
+        cx.run_until_parked();
+        let buffer = project.read_with(cx, |project, cx| {
+            let path = project.find_project_path(path, cx).expect("project path");
+            project.get_open_buffer(&path, cx).expect("open buffer")
+        });
+        assert_eq!(buffer.read_with(cx, |buffer, _| buffer.text()), content);
+
+        // Replace the on-disk target while the buffered write is still streaming.
+        fs.pause_events();
+        let disk_path = path!("/root/file.txt");
+        fs.remove_file(disk_path.as_ref(), fs::RemoveOptions::default())
+            .await
+            .expect("remove file");
+        fs.create_dir(disk_path.as_ref())
+            .await
+            .expect("replace file with directory");
+        sender.send_full(json!({"path": path, "content": content}));
+        let output = task.await.expect_err("failed save must not report success");
+        assert!(matches!(
+            output,
+            EditSessionOutput::Error { error, diff, .. }
+                if error.contains("Failed to save edits to disk") && diff.contains(content)
+        ));
+        assert!(fs.is_dir(disk_path.as_ref()).await);
+        buffer.read_with(cx, |buffer, _| {
+            assert!(buffer.is_dirty());
+            assert_eq!(buffer.text(), content);
+        });
+        fs.unpause_events_and_flush();
+    }
+
+    #[gpui::test]
     async fn test_streaming_write_create_file(cx: &mut TestAppContext) {
         let (write_tool, _project, _action_log, _fs, _thread) =
             setup_test(cx, json!({"dir": {}})).await;

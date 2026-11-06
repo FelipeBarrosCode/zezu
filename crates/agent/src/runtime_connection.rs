@@ -20,7 +20,9 @@ use futures::FutureExt as _;
 use gpui::{
     App, AppContext as _, AsyncApp, Entity, Global, SharedString, Task, TaskExt as _, WeakEntity,
 };
-use language_model::{LanguageModelRegistry, MessageContent};
+use language_model::{
+    LanguageModelId, LanguageModelProviderId, LanguageModelRegistry, MessageContent, SelectedModel,
+};
 use project::{AgentId, Project};
 use serde_json::{Value, json};
 use settings::Settings as _;
@@ -95,6 +97,48 @@ impl NativeRuntimeConnection {
         &self.legacy
     }
 
+    pub fn thread_model(
+        &self,
+        session_id: &acp_v2::SessionId,
+        cx: &App,
+    ) -> Option<crate::ThreadModel> {
+        let configurations = self.configurations.borrow();
+        let configuration = configurations.get(runtime_id(session_id)?)?;
+        Some(match configured_model(configuration, cx) {
+            Ok(model) => crate::ThreadModel::Ready(model),
+            Err(_) => match &configuration.model {
+                Some(selection) => crate::ThreadModel::Unresolved(SelectedModel {
+                    provider: LanguageModelProviderId(selection.provider.0.clone().into()),
+                    model: LanguageModelId(selection.model.clone().into()),
+                }),
+                None => crate::ThreadModel::Unset,
+            },
+        })
+    }
+
+    pub fn validate_prompt_model(
+        &self,
+        session_id: &acp_v2::SessionId,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        let Some(id) = runtime_id(session_id) else {
+            return Task::ready(Ok(()));
+        };
+        if !self.configurations.borrow().contains_key(id) {
+            return Task::ready(Ok(()));
+        }
+        let id = id.to_owned();
+        let store = self.store(cx);
+        cx.spawn(async move |cx| {
+            let configuration = serde_json::from_value(store?.metadata(id).await?)?;
+            cx.update(|cx| {
+                configured_model(&configuration, cx)
+                    .map(|_| ())
+                    .map_err(|error| error.context(crate::NoModelConfiguredError))
+            })
+        })
+    }
+
     pub fn available_skills(
         &self,
         session: &acp_v2::SessionId,
@@ -129,45 +173,57 @@ impl NativeRuntimeConnection {
         project: Entity<Project>,
         configuration: NativeRuntimeConfig,
         cx: &mut App,
-    ) -> Task<Result<NativeRuntimeConfig>> {
+    ) -> Task<Result<(NativeRuntimeConfig, Option<String>)>> {
         let fs = self.fs.clone();
         let host = self.host.clone();
         let configurations = self.configurations.clone();
         let skills = self.skills.clone();
+        let settings = AgentSettings::get_global(cx);
         let profile = configuration
             .profile
             .clone()
-            .unwrap_or_else(|| AgentSettings::get_global(cx).default_profile.clone());
-        let selected = configuration.model.as_ref().or_else(|| {
-            AgentSettings::get_global(cx)
-                .profiles
-                .get(&profile)
-                .and_then(|profile| profile.default_model.as_ref())
-        });
+            .unwrap_or_else(|| settings.default_profile.clone());
+        let selected = configuration
+            .model
+            .as_ref()
+            .or_else(|| settings.profiles.get(&profile)?.default_model.as_ref());
         let model = match selected {
             Some(selection) => crate::native_runtime::resolve_model_id(
                 &format!("{}/{}", selection.provider.0, selection.model),
                 cx,
-            ),
-            None => LanguageModelRegistry::read_global(cx)
-                .default_model()
-                .context("select a model before starting an agent"),
+            )
+            .ok(),
+            None => LanguageModelRegistry::read_global(cx).default_model(),
         };
-        let model = match model {
-            Ok(model) => model,
-            Err(error) => return Task::ready(Err(error)),
-        };
-        let selected = selected.or_else(|| {
-            AgentSettings::get_global(cx)
+        let selected = selected.or_else(|| match &model {
+            Some(model) => settings.default_model.as_ref().filter(|selection| {
+                selection.provider.0 == model.provider_id().0.as_ref()
+                    && selection.model == model.id().0.as_ref()
+            }),
+            None => cx
+                .global::<settings::SettingsStore>()
+                .raw_user_settings()?
+                .content
+                .agent
+                .as_ref()?
                 .default_model
-                .as_ref()
-                .filter(|selection| {
-                    selection.provider.0 == model.provider_id().0.as_ref()
-                        && selection.model == model.id().0.as_ref()
-                })
+                .as_ref(),
         });
-        let pinned_model = language_model_to_selection(&model, selected);
-        let provider = model.provider_id();
+        // A provider can populate its catalog after the conversation opens. Keep the
+        // requested selection so the picker can recover without changing models implicitly.
+        let pinned_model = model
+            .as_ref()
+            .map(|model| language_model_to_selection(model, selected))
+            .or_else(|| selected.cloned());
+        let provider = pinned_model
+            .as_ref()
+            .map(|selection| LanguageModelProviderId(selection.provider.0.clone().into()));
+        if model.is_none()
+            && let Some(provider) = provider.as_ref()
+            && let Some(provider) = LanguageModelRegistry::read_global(cx).provider(provider)
+        {
+            provider.refresh_models(cx);
+        }
         let registry = match RuntimeWorkspaceProjects::new(
             project.clone(),
             AgentSettings::get_global(cx)
@@ -187,28 +243,33 @@ impl NativeRuntimeConnection {
             payload: json!({}),
             result: None,
         };
-        let actions = registry.read(cx).code_actions_for(&catalog_job);
-        let catalog = RuntimeMcpCatalog::new(project.clone(), cx);
-        let mut tools = match runtime_project_tools(
-            project.clone(),
-            &id,
-            &provider,
-            &profile,
-            actions.clone(),
-            cx,
-        ) {
-            Ok(tools) => tools,
-            Err(error) => return Task::ready(Err(error)),
+        let tool_names = if let Some(provider) = &provider {
+            let actions = registry.read(cx).code_actions_for(&catalog_job);
+            let catalog = RuntimeMcpCatalog::new(project.clone(), cx);
+            let mut tools = match runtime_project_tools(
+                project.clone(),
+                &id,
+                provider,
+                &profile,
+                actions,
+                cx,
+            ) {
+                Ok(tools) => tools,
+                Err(error) => return Task::ready(Err(error)),
+            };
+            if let Err(error) = catalog.merge_into(&mut tools, &profile, provider, cx) {
+                return Task::ready(Err(error));
+            }
+            tools.keys().cloned().collect()
+        } else {
+            Vec::new()
         };
-        if let Err(error) = catalog.merge_into(&mut tools, &profile, &provider, cx) {
-            return Task::ready(Err(error));
-        }
         let context = prepare_runtime_context(
             project.clone(),
             fs,
             Some(profile),
-            tools.keys().cloned().collect(),
-            Some(model.name().0.to_string()),
+            tool_names,
+            model.map(|model| model.name().0.to_string()),
             cx,
         );
         let store = match self.store(cx) {
@@ -252,7 +313,7 @@ impl NativeRuntimeConnection {
         cx.spawn(async move |cx| {
             let prepared = context.await?;
             let available_skills = Arc::new(prepared.skills.clone());
-            let mut configuration = prepared.configuration(Some(pinned_model));
+            let mut configuration = prepared.configuration(pinned_model);
             let services = if let Some(repository) = repository.await? {
                 let preparation = cx.update(|cx| {
                     if !cx.has_global::<RuntimeServicesCache>() {
@@ -300,11 +361,13 @@ impl NativeRuntimeConnection {
             } else {
                 RuntimeOrchestrationServices::metadata_only(store.clone())
             };
+            let workspace_error = services.workspace_error.clone();
             append_runtime_instructions(&mut configuration.system_prompt, &services);
             let profile = prepared.profile_id;
             let runtime_profile = profile.clone();
             let original_project = project.clone();
             let resolver_registry = registry.clone();
+            let has_provider = provider.is_some();
             let resolver: RuntimeToolResolver = Rc::new(move |job, _snapshot, cx| {
                 let requested_profile = job
                     .payload
@@ -325,7 +388,8 @@ impl NativeRuntimeConnection {
                     .map(|(provider, _)| {
                         language_model::LanguageModelProviderId(provider.to_owned().into())
                     })
-                    .unwrap_or_else(|| provider.clone());
+                    .or_else(|| provider.clone())
+                    .context("select a model before running agent tools")?;
                 let project = resolver_registry.read(cx).project_for(job, cx)?;
                 let actions = resolver_registry.read(cx).code_actions_for(job);
                 let action_log = resolver_registry.read(cx).action_log_for(job);
@@ -370,6 +434,9 @@ impl NativeRuntimeConnection {
             let loader_services = services.clone();
             let resolver = with_runtime_orchestration(resolver, runtime_profile, services, sink);
             let definitions = cx.update(|cx| {
+                if !has_provider {
+                    return Ok(Vec::new());
+                }
                 let job = agent_runtime::Job {
                     id: "catalog".into(),
                     agent_id: id.clone(),
@@ -419,7 +486,7 @@ impl NativeRuntimeConnection {
             skills
                 .borrow_mut()
                 .insert(catalog_job.agent_id, available_skills);
-            Ok(configuration)
+            Ok((configuration, workspace_error))
         })
     }
 
@@ -482,22 +549,31 @@ impl NativeRuntimeConnection {
                 let lease = store.begin_configuration(id.clone()).await?;
                 let prepared = cx.update(|cx| connection.register_project(id.clone(), project.clone(), configuration, cx)).await;
                 let result = match prepared {
-                    Ok(configuration) => match serde_json::to_value(configuration) {
-                        Ok(metadata) => store.commit_configuration(lease.clone(), metadata).await,
+                    Ok((configuration, workspace_error)) => match serde_json::to_value(configuration) {
+                        Ok(metadata) => store.commit_configuration(lease.clone(), metadata).await.map(|()| workspace_error),
                         Err(error) => Err(error.into()),
                     },
                     Err(error) => Err(error),
                 };
-                if let Err(error) = result {
-                    cx.update(|cx| connection.register_project(id.clone(), project, old_configuration, cx)).await
-                        .context("failed to restore the previous runtime binding; restart to recover the paused agent")?;
-                    store.abort_configuration(lease).await?;
-                    return Err(error);
-                }
+                let workspace_error = match result {
+                    Ok(workspace_error) => workspace_error,
+                    Err(error) => {
+                        cx.update(|cx| connection.register_project(id.clone(), project, old_configuration, cx)).await
+                            .context("failed to restore the previous runtime binding; restart to recover the paused agent")?;
+                        store.abort_configuration(lease).await?;
+                        return Err(error);
+                    }
+                };
                 cx.update(|cx| {
+                    let view = connection.views.borrow().get(&id).map(|projection| projection.view.clone());
+                    if let Some(view) = view
+                        && let Err(error) = view.update(cx, |thread, cx| update_workspace_notice(thread, workspace_error, cx))
+                    {
+                        log::debug!("workspace notice view detached: {error:#}");
+                    }
                     if let Some(control) = connection.config_controls.borrow().get(&id).and_then(std::rc::Weak::upgrade) {
                         let configuration = connection.configurations.borrow().get(&id).cloned().unwrap_or_default();
-                        control.replace_options(runtime_model_options(&configuration, cx)?);
+                        control.replace_options(runtime_model_options(&configuration, cx).unwrap_or_default());
                     }
                     connection.legacy.0.update(cx, |agent, _| agent.models.notify_model_selection_changed());
                     if changed_model.is_some() || changed_profile.is_some() {
@@ -568,8 +644,19 @@ impl NativeRuntimeConnection {
                         Ok(true) => {}
                         Ok(false) => break,
                         Err(error) => {
-                            log::debug!("runtime projection stopped: {error:#}");
-                            break;
+                            if view.upgrade().is_none() {
+                                break;
+                            }
+                            log::warn!("could not update runtime transcript: {error:#}");
+                            view.update(cx, |thread, cx| {
+                                projection_notice(
+                                    thread,
+                                    "Could not read saved messages",
+                                    "Reopen the conversation to retry.",
+                                    cx,
+                                );
+                            })
+                            .log_err();
                         }
                     }
                     loop {
@@ -621,7 +708,7 @@ impl NativeRuntimeConnection {
             Ok(page
                 .entries
                 .iter()
-                .filter_map(|entry| history_text(&entry.payload))
+                .filter_map(|entry| history_text(&entry.payload).ok().flatten())
                 .map(|(_, text)| text)
                 .collect::<Vec<_>>()
                 .join("\n\n")
@@ -683,11 +770,17 @@ impl AgentConnection for NativeRuntimeConnection {
             cx,
         );
         cx.spawn(async move |cx| {
-            let configuration = context.await?;
+            let (configuration, workspace_error) = context.await?;
             store
                 .create_root(id.clone(), serde_json::to_value(configuration)?)
                 .await?;
-            Ok(cx.update(|cx| self.projection(id, project, work_dirs, None, -1, cx)))
+            Ok(cx.update(|cx| {
+                let thread = self.projection(id, project, work_dirs, None, -1, cx);
+                thread.update(cx, |thread, cx| {
+                    update_workspace_notice(thread, workspace_error, cx)
+                });
+                thread
+            }))
         })
     }
 
@@ -711,16 +804,18 @@ impl AgentConnection for NativeRuntimeConnection {
             let snapshot = store.snapshot(id.clone()).await?;
             let configuration =
                 serde_json::from_value(store.metadata(snapshot.root_id.clone()).await?)?;
-            cx.update(|cx| {
-                self.register_project(snapshot.root_id, project.clone(), configuration, cx)
-            })
-            .await?;
+            let (_, workspace_error) = cx
+                .update(|cx| {
+                    self.register_project(snapshot.root_id, project.clone(), configuration, cx)
+                })
+                .await?;
             let page = store.transcript_page(id.clone(), None, PAGE_SIZE).await?;
             let position = page.entries.last().map_or(-1, |entry| entry.position);
             let thread =
                 cx.update(|cx| self.projection(id, project, work_dirs, title, position, cx));
             thread.update(cx, |thread, cx| {
-                project_history(thread, page.entries, true, cx)
+                project_history(thread, page.entries, true, cx);
+                update_workspace_notice(thread, workspace_error, cx);
             });
             Ok(thread)
         })
@@ -754,17 +849,29 @@ impl AgentConnection for NativeRuntimeConnection {
         if let Err(error) = self.validate_prompt_content(&params.prompt) {
             return Task::ready(Err(error));
         }
+        // ACP calls this method during a thread update. Access its projection
+        // inside the returned task, once that update has finished.
         if params.prompt.first().is_some_and(|block| matches!(block, acp_v2::ContentBlock::Text(text) if text.text.trim_start().split_whitespace().next() == Some("/compact"))) {
             let card_id = acp_thread::ContextCompactionId(uuid::Uuid::new_v4().to_string().into());
             let view = self.views.borrow().get(&id).map(|projection| projection.view.clone());
-            if let Some(view) = &view {
-                view.update(cx, |thread, cx| thread.push_context_compaction(acp_thread::ContextCompaction {
-                    id: card_id.clone(), status: acp_thread::ContextCompactionStatus::InProgress,
-                    error: None, summary: acp_thread::MessageContent::default(), meta: None,
-                }, cx)).log_err();
-            }
-            let task = self.host.update(cx, |host, cx| host.compact(id, cx));
+            let host = self.host.clone();
             return cx.spawn(async move |cx| {
+                if let Some(view) = &view {
+                    view.update(cx, |thread, cx| {
+                        thread.push_context_compaction(
+                            acp_thread::ContextCompaction {
+                                id: card_id.clone(),
+                                status: acp_thread::ContextCompactionStatus::InProgress,
+                                error: None,
+                                summary: acp_thread::MessageContent::default(),
+                                meta: None,
+                            },
+                            cx,
+                        )
+                    })
+                    .log_err();
+                }
+                let task = host.update(cx, |host, cx| host.compact(id, cx));
                 let result = task.await;
                 if let Some(view) = view {
                     let status = if result.is_ok() { acp_thread::ContextCompactionStatus::Completed } else { acp_thread::ContextCompactionStatus::Failed };
@@ -792,45 +899,37 @@ impl AgentConnection for NativeRuntimeConnection {
         let Some((view, position, usage)) = projection else {
             return Task::ready(Err(anyhow::anyhow!("conversation projection is detached")));
         };
-        let content = view
-            .read_with(cx, |thread, cx| {
-                params
-                    .prompt
-                    .into_iter()
-                    .map(|block| {
-                        UserMessageContent::from_content_block(
-                            block,
-                            thread.project().read(cx).path_style(cx),
-                        )
-                    })
-                    .collect::<Result<Vec<_>>>()
-            })
-            .and_then(|result| result);
-        let mut content = match content {
-            Ok(content) => content,
-            Err(error) => return Task::ready(Err(error)),
-        };
-        let skill_name = content.first().and_then(|content| match content {
-            UserMessageContent::Text(text) => text
-                .trim_start()
-                .strip_prefix('/')
-                .and_then(|command| command.split_whitespace().next()),
-            _ => None,
-        });
-        let skill = skill_name.and_then(|name| {
-            self.skills
-                .borrow()
-                .get(&id)
-                .and_then(|skills| skills.iter().find(|skill| skill.name == name).cloned())
-        });
-        let project = match view.read_with(cx, |thread, _| thread.project().clone()) {
-            Ok(project) => project,
-            Err(error) => return Task::ready(Err(error)),
-        };
-        let read_skill = crate::skill_body_resolver_for_project(project, self.fs.clone());
+        let model_check = self.validate_prompt_model(&params.session_id, cx);
+        let skills = self.skills.clone();
+        let fs = self.fs.clone();
         cx.spawn(async move |cx| {
+            model_check.await?;
             ensure_no_uncertain_tools(&store, &id).await?;
+            let (project, path_style) = view.read_with(cx, |thread, cx| {
+                let project = thread.project().clone();
+                let path_style = project.read(cx).path_style(cx);
+                (project, path_style)
+            })?;
+            let mut content = params
+                .prompt
+                .into_iter()
+                .map(|block| UserMessageContent::from_content_block(block, path_style))
+                .collect::<Result<Vec<_>>>()?;
+            let skill_name = content.first().and_then(|content| match content {
+                UserMessageContent::Text(text) => text
+                    .trim_start()
+                    .strip_prefix('/')
+                    .and_then(|command| command.split_whitespace().next()),
+                _ => None,
+            });
+            let skill = skill_name.and_then(|name| {
+                skills
+                    .borrow()
+                    .get(&id)
+                    .and_then(|skills| skills.iter().find(|skill| skill.name == name).cloned())
+            });
             if let Some(skill) = skill {
+                let read_skill = crate::skill_body_resolver_for_project(project, fs);
                 let body = match skill.embedded_body { Some(body) => body.to_owned(), None => read_skill(skill.clone(), cx).await? };
                 let envelope = crate::tools::render_skill_envelope(&skill, &body);
                 if let Some(UserMessageContent::Text(text)) = content.first_mut() { *text = crate::strip_slash_command_prefix(text); }
@@ -959,7 +1058,7 @@ impl AgentConnection for NativeRuntimeConnection {
             .get(&id)
             .cloned()
             .unwrap_or_default();
-        let options = runtime_model_options(&configuration, cx).ok()?;
+        let options = runtime_model_options(&configuration, cx).unwrap_or_default();
         let connection = self.clone();
         let control_id = id.clone();
         let control = Rc::new(RuntimeSessionConfigOptions::new(
@@ -1083,12 +1182,10 @@ fn runtime_model_options(
                 )
             })
             .collect::<Vec<_>>();
-        options.push(acp_v2::SessionConfigOption::select(
-            "effort",
-            "Reasoning effort",
-            current,
-            choices,
-        ));
+        options.push(
+            acp_v2::SessionConfigOption::select("effort", "Reasoning effort", current, choices)
+                .category(acp_v2::SessionConfigOptionCategory::ThoughtLevel),
+        );
     }
     if model.supports_fast_mode() {
         options.push(acp_v2::SessionConfigOption::boolean(
@@ -1133,19 +1230,21 @@ impl AgentModelSelector for RuntimeModelSelector {
             Err(error) => return Task::ready(Err(error)),
         };
         let id = self.id.clone();
+        let config_controls = self.connection.config_controls.clone();
         cx.spawn(async move |cx| {
             let configuration: NativeRuntimeConfig =
-                serde_json::from_value(store.metadata(id).await?)?;
+                serde_json::from_value(store.metadata(id.clone()).await?)?;
             cx.update(|cx| {
-                let model = match configuration.model {
-                    Some(selection) => crate::native_runtime::resolve_model_id(
-                        &format!("{}/{}", selection.provider.0, selection.model),
-                        cx,
-                    )?,
-                    None => LanguageModelRegistry::read_global(cx)
-                        .default_model()
-                        .context("no model selected")?,
-                };
+                if let Some(control) = config_controls
+                    .borrow()
+                    .get(&id)
+                    .and_then(std::rc::Weak::upgrade)
+                {
+                    control.replace_options(
+                        runtime_model_options(&configuration, cx).unwrap_or_default(),
+                    );
+                }
+                let model = configured_model(&configuration, cx)?;
                 let provider = LanguageModelRegistry::read_global(cx).provider_for_model(&model)?;
                 Ok(crate::LanguageModels::map_language_model_to_info(
                     &model, &provider,
@@ -1198,24 +1297,34 @@ async fn flush_projection(
     if view.upgrade().is_none() {
         return Ok(false);
     }
-    let after = position.get();
-    let entries = store
-        .transcript_after(agent_id.to_owned(), after, PAGE_SIZE)
-        .await?;
-    if !entries.is_empty() {
-        view.update(cx, |thread, cx| {
-            // A prompt completion and its observer may have read the same page concurrently.
-            let entries = entries
-                .into_iter()
-                .filter(|entry| entry.position > position.get())
-                .collect::<Vec<_>>();
-            if let Some(last) = entries.last() {
-                position.set(last.position);
+    loop {
+        let entries = store
+            .transcript_after(agent_id.to_owned(), position.get(), PAGE_SIZE)
+            .await?;
+        if entries.is_empty() {
+            break;
+        }
+        for entry in entries {
+            // A prompt completion and its observer may have read the same page.
+            if entry.position <= position.get() {
+                continue;
             }
-            project_history(thread, entries, false, cx);
-        })?;
+            // Let the live view handle each append before changing the entry count again.
+            view.update(cx, |thread, cx| {
+                project_history_entry(thread, &entry, false, cx);
+                position.set(entry.position);
+            })?;
+        }
+        // A short page can hit the byte limit before the row limit.
+        futures_lite::future::yield_now().await;
     }
-    let usage = store.last_provider_usage(agent_id.to_owned()).await?;
+    let usage = match store.last_provider_usage(agent_id.to_owned()).await {
+        Ok(usage) => usage,
+        Err(error) => {
+            log::warn!("could not read runtime usage: {error:#}");
+            return Ok(view.upgrade().is_some());
+        }
+    };
     view.update(cx, |thread, cx| {
         let Some(record) = usage else {
             projected_usage.borrow_mut().take();
@@ -1258,32 +1367,60 @@ async fn flush_projection(
     Ok(true)
 }
 
-fn history_text(payload: &Value) -> Option<(bool, String)> {
-    let content = payload.get("content")?;
-    match payload.get("kind")?.as_str()? {
-        "user" => content
-            .get("text")
+fn history_text(payload: &Value) -> Result<Option<(bool, String)>> {
+    let content = payload.get("content");
+    match payload.get("kind").and_then(Value::as_str) {
+        Some("user") => Ok(content
+            .and_then(|content| content.get("text"))
             .and_then(Value::as_str)
-            .map(|text| (false, text.to_owned())),
-        "assistant" if content.get("type").and_then(Value::as_str) == Some("text") => content
-            .get("text")
-            .and_then(Value::as_str)
-            .map(|text| (false, text.to_owned())),
-        "assistant" => content
-            .get("content")
-            .and_then(Value::as_array)
-            .map(|blocks| {
-                (
-                    true,
-                    blocks
-                        .iter()
-                        .filter_map(|block| block.get("text").and_then(Value::as_str))
-                        .collect::<Vec<_>>()
-                        .join(""),
-                )
-            }),
-        _ => None,
+            .map(|text| (false, text.to_owned()))),
+        Some("assistant") => assistant_history_text(content.context("missing assistant content")?),
+        _ => Ok(None),
     }
+}
+
+fn assistant_history_text(content: &Value) -> Result<Option<(bool, String)>> {
+    let content_type = content
+        .get("type")
+        .map(|tag| tag.as_str().context("invalid assistant content type"))
+        .transpose()?;
+    // Infinity's AssistantContent is untagged. Older projections also accepted tagged text.
+    if matches!(content_type, None | Some("text"))
+        && let Some(text) = content.get("text")
+    {
+        let text = text.as_str().context("invalid assistant text")?;
+        return Ok((!text.is_empty()).then(|| (false, text.to_owned())));
+    }
+    ensure!(
+        matches!(content_type, None | Some("reasoning")),
+        "unsupported assistant content type"
+    );
+    let blocks = content
+        .get("content")
+        .and_then(Value::as_array)
+        .context("unsupported assistant content shape")?;
+    let mut thinking = String::new();
+    for block in blocks {
+        let text = match block.get("type").and_then(Value::as_str) {
+            Some("text") => block
+                .pointer("/content/text")
+                .or_else(|| block.get("text"))
+                .and_then(Value::as_str)
+                .context("invalid reasoning text")?,
+            Some("summary") => block
+                .get("content")
+                .and_then(Value::as_str)
+                .context("invalid reasoning summary")?,
+            Some("provider_state" | "encrypted" | "redacted") => continue,
+            None if block.get("type").is_none() => block
+                .get("text")
+                .and_then(Value::as_str)
+                .context("unsupported reasoning block")?,
+            _ => anyhow::bail!("unsupported reasoning block type"),
+        };
+        thinking.push_str(text);
+    }
+    Ok((!thinking.is_empty()).then_some((true, thinking)))
 }
 
 fn project_history(
@@ -1293,23 +1430,91 @@ fn project_history(
     cx: &mut gpui::Context<AcpThread>,
 ) {
     for entry in entries {
-        let user = entry.payload.get("kind").and_then(Value::as_str) == Some("user");
-        if user && !replay_users {
-            continue;
-        }
-        if let Some((thinking, text)) = history_text(&entry.payload) {
-            if user {
-                thread.push_user_content_block(None, text.into(), cx);
-            } else {
-                thread.push_assistant_content_block(text.into(), thinking, cx);
-            }
-        } else if let Some(update) = history_tool_update(&entry.payload) {
-            thread.update_tool_call(update, cx).log_err();
-        } else if user {
-            if let Some(content) = entry.payload.get("content").and_then(history_content) {
+        project_history_entry(thread, &entry, replay_users, cx);
+    }
+}
+
+fn project_history_entry(
+    thread: &mut AcpThread,
+    entry: &TranscriptEntry,
+    replay_users: bool,
+    cx: &mut gpui::Context<AcpThread>,
+) {
+    let result = (|| -> Result<()> {
+        let payload = &entry.payload;
+        match payload.get("kind").and_then(Value::as_str) {
+            Some("user") if replay_users => {
+                let content = history_text(payload)?
+                    .map(|(_, text)| text.into())
+                    .or_else(|| payload.get("content").and_then(history_content))
+                    .context("unsupported user content")?;
                 thread.push_user_content_block(None, content, cx);
             }
+            Some("assistant") => {
+                if let Some((thinking, text)) = history_text(payload)? {
+                    thread.push_assistant_content_block(text.into(), thinking, cx);
+                }
+            }
+            Some("tool_call" | "tool_result") => {
+                let update = history_tool_update(payload).context("unsupported tool content")?;
+                thread.update_tool_call(update, cx)?;
+            }
+            Some("user" | "subscription_event") => {}
+            _ => anyhow::bail!("unsupported history record kind"),
         }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        log::warn!(
+            "could not display runtime history row {}: {error:#}",
+            entry.position
+        );
+        projection_notice(
+            thread,
+            "Some saved messages could not be displayed",
+            "The original messages are still saved. See the Zed log for details.",
+            cx,
+        );
+    }
+}
+
+fn projection_notice(
+    thread: &mut AcpThread,
+    title: &'static str,
+    description: &'static str,
+    cx: &mut gpui::Context<AcpThread>,
+) {
+    if !thread
+        .notices()
+        .iter()
+        .any(|(_, notice)| notice.title == title)
+    {
+        thread.push_notice(
+            acp_v2::Notice::new(acp_v2::NoticeSeverity::Warning, title).description(description),
+            cx,
+        );
+    }
+}
+
+fn update_workspace_notice(
+    thread: &mut AcpThread,
+    description: Option<String>,
+    cx: &mut gpui::Context<AcpThread>,
+) {
+    const TITLE: &str = "Editing workspace unavailable";
+    let previous = thread
+        .notices()
+        .iter()
+        .find(|(_, notice)| notice.title == TITLE)
+        .map(|(id, _)| *id);
+    if let Some(id) = previous {
+        thread.dismiss_notice(id, cx);
+    }
+    if let Some(description) = description {
+        thread.push_notice(
+            acp_v2::Notice::new(acp_v2::NoticeSeverity::Warning, TITLE).description(description),
+            cx,
+        );
     }
 }
 
@@ -1485,7 +1690,11 @@ pub(crate) fn project_runtime_tool_event(
 mod tests {
     use super::*;
     use fs::FakeFs;
-    use gpui::TestAppContext;
+    use gpui::{TestAppContext, UpdateGlobal as _};
+    use infinity_agent_core::{ThreadId, message::InfinityMessage, traits::ConversationStore as _};
+    use infinity_provider_protocol::message::{
+        AssistantContent, Reasoning, ReasoningContent, UserContent,
+    };
     use language_model::{
         LanguageModelCompletionEvent, LanguageModelToolUse, LanguageModelToolUseInput, StopReason,
     };
@@ -1500,6 +1709,166 @@ mod tests {
             // These workers run on OS threads, outside the simulated GPUI clock.
             async_io::Timer::after(Duration::from_millis(2)).await;
         }
+    }
+
+    #[gpui::test]
+    async fn runtime_session_recovers_unavailable_model(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let provider = crate::tests::init_test(cx);
+        let model = provider.model("fake");
+        let mut unavailable = language_model_to_selection(&model, None);
+        unavailable.model = "removed-from-catalog".into();
+        cx.update(|cx| {
+            settings::SettingsStore::update_global(cx, |store, cx| {
+                store
+                    .set_user_settings(
+                        &json!({"agent": {"default_model": unavailable}}).to_string(),
+                        cx,
+                    )
+                    .result()
+                    .expect("test settings should parse");
+            });
+            LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
+                registry.set_default_model(None, cx);
+            });
+        });
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let directory = tempfile::tempdir().expect("directory");
+        let host = cx.update(|cx| NativeRuntime::global(cx).expect("host"));
+        let runtime = host
+            .update(cx, |host, cx| {
+                host.start_database(
+                    directory.path().join("runtime.sqlite"),
+                    agent_runtime::RuntimeLimits::default(),
+                    cx,
+                )
+            })
+            .await
+            .expect("runtime");
+        let connection = cx.update(|cx| {
+            let thread_store = cx.new(crate::ThreadStore::new);
+            let legacy = NativeAgentConnection(crate::NativeAgent::new(
+                thread_store,
+                crate::Templates::new(),
+                fs.clone(),
+                cx,
+            ));
+            Rc::new(NativeRuntimeConnection::new(legacy, host, fs))
+        });
+        let work_dirs = PathList::new::<&std::path::Path>(&[]);
+        let thread = cx
+            .update(|cx| {
+                connection
+                    .clone()
+                    .new_session(project.clone(), work_dirs.clone(), cx)
+            })
+            .await
+            .expect("open a conversation with an unavailable model");
+        let session = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let id = runtime_id(&session).expect("runtime session").to_owned();
+        let reopened_connection = Rc::new(NativeRuntimeConnection::new(
+            connection.legacy.clone(),
+            connection.host.clone(),
+            connection.fs.clone(),
+        ));
+        let reopened = cx
+            .update(|cx| {
+                reopened_connection.clone().load_session(
+                    session.clone(),
+                    project.clone(),
+                    work_dirs.clone(),
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("reopen the conversation with its saved model");
+        let selector = connection.model_selector(&session).expect("model picker");
+        assert!(cx.update(|cx| selector.selected_model(cx)).await.is_err());
+        assert!(cx.update(|cx| selector.list_models(cx)).await.is_ok());
+
+        let prompt = || acp_v2::PromptRequest::new(session.clone(), vec!["Hello".into()]);
+        let error = cx
+            .update(|cx| reopened_connection.prompt(prompt(), cx))
+            .await
+            .expect_err("the unavailable selection must block inference");
+        assert!(error.is::<crate::NoModelConfiguredError>());
+        assert_eq!(
+            runtime
+                .store
+                .snapshot(id.clone())
+                .await
+                .expect("agent")
+                .state,
+            "waiting"
+        );
+        assert!(provider.pending_completions_for(&model).is_empty());
+
+        let compaction_error = reopened
+            .update(cx, |thread, cx| {
+                thread.send_command(vec!["/compact".into()], cx)
+            })
+            .await
+            .expect_err("compaction should report the unavailable model");
+        assert!(format!("{compaction_error:#}").contains("removed-from-catalog"));
+
+        cx.update(|cx| {
+            selector.select_model(
+                AgentModelId::from(format!("{}/{}", model.provider_id().0, model.id().0)),
+                cx,
+            )
+        })
+        .await
+        .expect("select a model from the live catalog");
+        let turns = [
+            ("Hello", "First answer from Infinity."),
+            ("Continue", "Second answer from Infinity."),
+        ];
+        for (prompt, answer) in turns {
+            let execution = reopened.update(cx, |thread, cx| thread.send(vec![prompt.into()], cx));
+            wait_until(|| !provider.pending_completions_for(&model).is_empty()).await;
+            let request = provider.pending_completions_for(&model).remove(0);
+            provider.send_text(&model, &request, answer);
+            provider.send_event(
+                &model,
+                &request,
+                LanguageModelCompletionEvent::Stop(StopReason::EndTurn),
+            );
+            provider.end_stream(&model, &request);
+            execution
+                .await
+                .expect("completion in the recovered conversation");
+        }
+        let live_markdown = reopened.read_with(cx, |thread, cx| thread.to_markdown(cx));
+        drop(reopened);
+        drop(thread);
+        let replayed = cx
+            .update(|cx| {
+                reopened_connection.clone().load_session(
+                    session.clone(),
+                    project,
+                    work_dirs,
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("replay the saved conversation");
+        assert_eq!(
+            replayed.read_with(cx, |thread, _| thread.session_id().clone()),
+            session
+        );
+        let replayed_markdown = replayed.read_with(cx, |thread, cx| thread.to_markdown(cx));
+        for (_, answer) in turns {
+            assert_eq!(live_markdown.matches(answer).count(), 1, "live transcript");
+            assert_eq!(
+                replayed_markdown.matches(answer).count(),
+                1,
+                "replayed transcript"
+            );
+        }
+        assert!(replayed.read_with(cx, |thread, _| thread.notices().is_empty()));
     }
 
     #[gpui::test]
@@ -1581,14 +1950,8 @@ mod tests {
                 .0
                 .read_with(cx, |legacy, _| legacy.sessions.is_empty())
         );
-        let execution = cx.update(|cx| {
-            connection.prompt(
-                acp_v2::PromptRequest::new(
-                    session.clone(),
-                    vec!["Read the external linked file.".into()],
-                ),
-                cx,
-            )
+        let execution = thread.update(cx, |thread, cx| {
+            thread.send(vec!["Read the external linked file.".into()], cx)
         });
         wait_until(|| !provider.pending_completions_for(&model).is_empty()).await;
         let request = provider
@@ -1666,6 +2029,9 @@ mod tests {
         );
         provider.end_stream(&model, &request);
         execution.await.expect("completion");
+        assert!(thread.read_with(cx, |thread, cx| {
+            thread.to_markdown(cx).contains("Read successfully.")
+        }));
         assert_eq!(
             thread.read_with(cx, |thread, _| thread.token_usage().cloned()),
             Some(acp_thread::TokenUsage {
@@ -1678,23 +2044,93 @@ mod tests {
         );
         let id = runtime_id(&session).expect("runtime id").to_owned();
         let (view, position, usage) = {
-            let projections = connection.views.borrow();
-            let projection = projections.get(&id).expect("projection");
+            let mut projections = connection.views.borrow_mut();
+            let projection = projections.get_mut(&id).expect("projection");
+            // Exercise one flush without an observer racing to read a second page.
+            projection._observer = Task::ready(());
             (
                 projection.view.clone(),
                 projection.position.clone(),
                 projection.usage.clone(),
             )
         };
+        let provider_state = InfinityMessage::Assistant {
+            content: AssistantContent::Reasoning(Reasoning {
+                id: None,
+                content: vec![provider_state_block()],
+            }),
+        };
+        let mut history = (0..PAGE_SIZE)
+            .map(|index| (provider_state.clone(), format!("projection-state-{index}")))
+            .collect::<Vec<_>>();
+        history.push((
+            InfinityMessage::Assistant {
+                content: AssistantContent::ToolCall(
+                    infinity_provider_protocol::message::ToolCall::new(
+                        "unexpected-assistant-call",
+                        "unsupported_shape",
+                        json!({}),
+                    ),
+                ),
+            },
+            "projection-unsupported".into(),
+        ));
+        history.push((
+            InfinityMessage::ToolCall {
+                call: infinity_provider_protocol::message::ToolCall::new(
+                    "projection-call",
+                    "read_file",
+                    json!({"path":"example.txt"}),
+                ),
+                display_as: None,
+            },
+            "projection-tool-call".into(),
+        ));
+        let last_answer = "Visible answer from the next page.";
+        history.push((
+            InfinityMessage::Assistant {
+                content: AssistantContent::text(last_answer),
+            },
+            "projection-answer".into(),
+        ));
+        let last_position = position.get() + history.len() as i64;
+        agent_runtime::SqliteInfinityStore::new(runtime.store.clone())
+            .append_messages(ThreadId::from_ref(&id), history)
+            .await
+            .expect("persist a burst spanning transcript pages");
+        let initial_entry_count = thread.read_with(cx, |thread, _| thread.entries().len());
+        let live_entry_counts = Rc::new(RefCell::new(Vec::new()));
+        let _entry_subscription = cx.update(|cx| {
+            let counts = live_entry_counts.clone();
+            cx.subscribe(&thread, move |thread, event, cx| {
+                if matches!(event, acp_thread::AcpThreadEvent::NewEntry) {
+                    counts.borrow_mut().push(thread.read(cx).entries().len());
+                }
+            })
+        });
         let store = runtime.store.clone();
         cx.update(|cx| {
             cx.spawn(async move |cx| {
+                flush_projection(&store, &id, &view, &position, &usage, cx).await?;
+                assert_eq!(position.get(), last_position);
                 flush_projection(&store, &id, &view, &position, &usage, cx).await
             })
         })
         .await
         .expect("repeat projection");
         cx.run_until_parked();
+        assert_eq!(
+            *live_entry_counts.borrow(),
+            [initial_entry_count + 1, initial_entry_count + 2]
+        );
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(thread.to_markdown(cx).matches(last_answer).count(), 1);
+            assert_eq!(
+                thread.notices().len(),
+                1,
+                "unsupported history should be reported once"
+            );
+        });
         assert_eq!(
             output_tokens.get(),
             7,
@@ -1830,20 +2266,79 @@ mod tests {
 
     #[test]
     fn transcript_projection_preserves_thinking_and_user_roles() {
+        let user = serde_json::to_value(InfinityMessage::User {
+            content: UserContent::text("request"),
+        })
+        .unwrap();
+        let assistant = serde_json::to_value(InfinityMessage::Assistant {
+            content: AssistantContent::text("answer"),
+        })
+        .unwrap();
         assert_eq!(
-            history_text(&json!({"kind":"user","content":{"type":"text","text":"request"}})),
+            assistant,
+            json!({"kind":"assistant","content":{"text":"answer"}})
+        );
+        let reasoning = serde_json::to_value(InfinityMessage::Assistant {
+            content: AssistantContent::Reasoning(Reasoning {
+                id: None,
+                content: vec![
+                    ReasoningContent::Text {
+                        text: "thinking ".into(),
+                        signature: Some("signed".into()),
+                    },
+                    ReasoningContent::Summary("summary".into()),
+                ],
+            }),
+        })
+        .unwrap();
+        assert_eq!(
+            history_text(&user).unwrap(),
             Some((false, "request".into()))
         );
         assert_eq!(
-            history_text(&json!({"kind":"assistant","content":{"type":"text","text":"answer"}})),
+            history_text(&assistant).unwrap(),
+            Some((false, "answer".into()))
+        );
+        assert_eq!(
+            history_text(&reasoning).unwrap(),
+            Some((true, "thinking summary".into()))
+        );
+        assert_eq!(
+            history_text(&json!({"kind":"assistant","content":{"type":"text","text":"answer"}}))
+                .unwrap(),
             Some((false, "answer".into()))
         );
         assert_eq!(
             history_text(
                 &json!({"kind":"assistant","content":{"type":"reasoning","content":[{"type":"text","text":"reasoning","signature":"signed"}]}})
-            ),
+            ).unwrap(),
             Some((true, "reasoning".into()))
         );
+    }
+
+    fn provider_state_block() -> ReasoningContent {
+        ReasoningContent::ProviderState {
+            namespace: "zed.language-model.v1".into(),
+            value: json!({"kind":"stop","reason":"end_turn"}),
+        }
+    }
+
+    #[test]
+    fn transcript_projection_omits_opaque_reasoning() {
+        let payload = serde_json::to_value(InfinityMessage::Assistant {
+            content: AssistantContent::Reasoning(Reasoning {
+                id: None,
+                content: vec![
+                    provider_state_block(),
+                    ReasoningContent::Encrypted("encrypted".into()),
+                    ReasoningContent::Redacted {
+                        data: "redacted".into(),
+                    },
+                ],
+            }),
+        })
+        .unwrap();
+        assert_eq!(history_text(&payload).unwrap(), None);
     }
 
     #[test]
