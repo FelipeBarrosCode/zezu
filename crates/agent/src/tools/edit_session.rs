@@ -206,7 +206,7 @@ impl EditSessionContext {
         }
     }
 
-    async fn ensure_buffer_saved(&self, buffer: &Entity<Buffer>, cx: &mut AsyncApp) {
+    async fn ensure_buffer_saved(&self, buffer: &Entity<Buffer>, cx: &mut AsyncApp) -> Result<()> {
         let format_on_save_enabled = buffer.read_with(cx, |buffer, cx| {
             let settings = language_settings::LanguageSettings::for_buffer(buffer, cx);
             settings.format_on_save != FormatOnSave::Off
@@ -227,14 +227,15 @@ impl EditSessionContext {
                 .log_err();
         }
 
-        self.project
+        let save_result = self
+            .project
             .update(cx, |project, cx| project.save_buffer(buffer.clone(), cx))
-            .await
-            .log_err();
+            .await;
 
         self.action_log.update(cx, |log, cx| {
             log.buffer_edited(buffer.clone(), cx);
         });
+        save_result
     }
 
     pub(crate) fn initial_title_from_path(
@@ -299,49 +300,52 @@ pub(crate) async fn run_session(
     event_stream: &ToolCallEventStream,
     cx: &mut AsyncApp,
 ) -> Result<EditSessionOutput, EditSessionOutput> {
-    match result {
-        EditSessionResult::Completed(session) => {
-            session
-                .context
-                .ensure_buffer_saved(&session.buffer, cx)
-                .await;
-            let (new_text, diff) = session.compute_new_text_and_diff(cx).await;
-            Ok(EditSessionOutput::Success {
-                old_text: session.old_text.clone(),
-                new_text,
-                input_path: session.input_path,
-                diff,
-            })
-        }
+    let (session, edit_error) = match result {
+        EditSessionResult::Completed(session) => (session, None),
         EditSessionResult::Failed {
             error,
             session: Some(session),
-        } => {
-            session
-                .context
-                .ensure_buffer_saved(&session.buffer, cx)
-                .await;
-            let (_new_text, diff) = session.compute_new_text_and_diff(cx).await;
-            if diff.is_empty() {
-                event_stream.update_fields(|update| update.content(vec![error.clone().into()]));
-            }
-            Err(EditSessionOutput::Error {
-                error,
-                input_path: Some(session.input_path),
-                diff,
-            })
-        }
+        } => (session, Some(error)),
         EditSessionResult::Failed {
             error,
             session: None,
         } => {
             event_stream.update_fields(|update| update.content(vec![error.clone().into()]));
-            Err(EditSessionOutput::Error {
-                error,
-                input_path: None,
-                diff: String::new(),
-            })
+            return Err(EditSessionOutput::error(error));
         }
+    };
+    let save_error = session
+        .context
+        .ensure_buffer_saved(&session.buffer, cx)
+        .await
+        .err()
+        .map(|error| {
+            format!(
+                "Failed to save edits to disk: {error:#}. Any edits remain unsaved in the buffer."
+            )
+        });
+    let (new_text, diff) = session.compute_new_text_and_diff(cx).await;
+    let save_failed = save_error.is_some();
+    let error = match (edit_error, save_error) {
+        (Some(edit_error), Some(save_error)) => Some(format!("{edit_error}\n{save_error}")),
+        (edit_error, save_error) => edit_error.or(save_error),
+    };
+    if let Some(error) = error {
+        if diff.is_empty() || save_failed {
+            event_stream.update_fields(|update| update.content(vec![error.clone().into()]));
+        }
+        Err(EditSessionOutput::Error {
+            error,
+            input_path: Some(session.input_path),
+            diff,
+        })
+    } else {
+        Ok(EditSessionOutput::Success {
+            old_text: session.old_text.clone(),
+            new_text,
+            input_path: session.input_path,
+            diff,
+        })
     }
 }
 

@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    io::Read as _,
+    io::{ErrorKind, Read as _},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -26,6 +26,14 @@ impl std::fmt::Display for InvalidWorkspace {
 }
 
 impl std::error::Error for InvalidWorkspace {}
+
+#[derive(Debug, Serialize)]
+pub struct SourceRepositoryPreflight {
+    pub repository_root: PathBuf,
+    pub head_commit: String,
+    pub target: Option<String>,
+    pub target_exists: Option<bool>,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkspaceLease {
@@ -87,19 +95,10 @@ impl WorkspacePool {
             "workspace capacity must be between 1 and 4096"
         );
         let (repository, directory) = blocking(move |cancelled| {
-            let invalid_root = || {
-                InvalidWorkspace(format!(
-                    "Open the Git repository root for your project. {} is not a usable repository root.",
-                    repository.display()
-                ))
-            };
-            let canonical = repository.canonicalize().with_context(invalid_root)?;
-            let actual = git(&canonical, &["rev-parse", "--show-toplevel"], &cancelled)
-                .with_context(invalid_root)?;
-            ensure!(
-                Path::new(actual.trim()).canonicalize().with_context(invalid_root)? == canonical,
-                invalid_root()
-            );
+            let canonical = repository
+                .canonicalize()
+                .with_context(|| invalid_repository_root(&repository))?;
+            validate_repository_root(&canonical, &cancelled)?;
             resolve_base_commit(&canonical, "HEAD", &cancelled)?;
             std::fs::create_dir_all(&directory)?;
             let directory = directory.canonicalize()?;
@@ -144,6 +143,54 @@ impl WorkspacePool {
             Ok(())
         }).await?;
         Ok(pool)
+    }
+
+    pub async fn source_preflight(
+        &self,
+        target: Option<String>,
+    ) -> Result<SourceRepositoryPreflight> {
+        if let Some(target) = target.as_deref() {
+            ensure!(
+                !target.is_empty()
+                    && target.len() <= 255
+                    && !target.contains(['/', '\\', ':'])
+                    && !target.chars().any(char::is_control)
+                    && !target.ends_with(['.', ' ']),
+                "target must be one top-level name of at most 255 bytes"
+            );
+        }
+        let repository_root = self.repository.clone();
+        self.run_operation(move |cancelled| {
+            ensure!(
+                repository_root
+                    .canonicalize()
+                    .with_context(|| invalid_repository_root(&repository_root))?
+                    == repository_root,
+                invalid_repository_root(&repository_root)
+            );
+            validate_repository_root(&repository_root, &cancelled)?;
+            let head_commit = resolve_base_commit(&repository_root, "HEAD", &cancelled)?;
+            // A single entry needs no path traversal. A dangling symlink still
+            // occupies the requested name and must prevent creation there.
+            let target_exists = target
+                .as_ref()
+                .map(
+                    |target| match std::fs::symlink_metadata(repository_root.join(target)) {
+                        Ok(_) => Ok(true),
+                        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+                        Err(error) => Err(error)
+                            .context("could not inspect the target in the source repository"),
+                    },
+                )
+                .transpose()?;
+            Ok(SourceRepositoryPreflight {
+                repository_root,
+                head_commit,
+                target,
+                target_exists,
+            })
+        })
+        .await
     }
 
     pub fn request_shutdown(&self) {
@@ -839,6 +886,26 @@ async fn blocking_with_stop<T: Send + 'static>(
 
 struct GitProcess(std::process::Child);
 
+fn invalid_repository_root(repository: &Path) -> InvalidWorkspace {
+    InvalidWorkspace(format!(
+        "Open the Git repository root for your project. {} is not a usable repository root.",
+        repository.display()
+    ))
+}
+
+fn validate_repository_root(repository: &Path, cancelled: &impl CancellationFlag) -> Result<()> {
+    let actual = git(repository, &["rev-parse", "--show-toplevel"], cancelled)
+        .with_context(|| invalid_repository_root(repository))?;
+    ensure!(
+        Path::new(actual.trim())
+            .canonicalize()
+            .with_context(|| invalid_repository_root(repository))?
+            == repository,
+        invalid_repository_root(repository)
+    );
+    Ok(())
+}
+
 fn resolve_base_commit(
     repository: &Path,
     base_ref: &str,
@@ -1080,6 +1147,82 @@ mod tests {
         assert!(message.contains(&repository.canonicalize()?.display().to_string()));
         assert!(message.contains("first commit"));
         assert!(!workspace_directory.exists());
+        store.shutdown().await
+    }
+
+    #[tokio::test]
+    async fn source_preflight_reads_checkout_without_leasing_a_workspace() -> Result<()> {
+        let (_directory, store, pool) = fixture(1).await?;
+        std::fs::create_dir(pool.repository.join("already-there"))?;
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                "../missing-outside-repository",
+                pool.repository.join("dangling-link"),
+            )?;
+            assert_eq!(
+                pool.source_preflight(Some("dangling-link".into()))
+                    .await?
+                    .target_exists,
+                Some(true)
+            );
+        }
+        let expected_commit =
+            resolve_base_commit(&pool.repository, "HEAD", &AtomicBool::new(false))?;
+        store
+            .enqueue_text_input("root".into(), "start".into(), "preflight".into())
+            .await?;
+        let lease = store.admit().await?.context("initial slice")?;
+        let requests = [
+            ("absent", "expense-summary", Some(false)),
+            ("present", "already-there", Some(true)),
+            ("escape", "../outside", None),
+        ];
+        for (id, target, _) in requests {
+            store
+                .record_job(
+                    lease.clone(),
+                    id.into(),
+                    json!({
+                        "tool":"runtime_workspace_preflight",
+                        "tool_call_id":id,
+                        "arguments":{"target":target},
+                    }),
+                )
+                .await?;
+        }
+        store
+            .finish(lease, json!({}), SliceOutcome::Waiting)
+            .await?;
+        let epoch = store.workspace_resource_epoch().await?;
+        for (id, target, expected) in requests {
+            let job = store.dispatch_job(id.into()).await?;
+            assert!(dispatch_runtime_job(store.clone(), job, Some(pool.clone())).await?);
+            let job = store.job(id.into()).await?;
+            assert_eq!(job.state, JobState::Completed);
+            let result = job.result.context("completed preflight")?;
+            let content = &result["content"];
+            let text = content["content"][0]["text"]
+                .as_str()
+                .context("preflight response text")?;
+            if let Some(expected) = expected {
+                let response: serde_json::Value = serde_json::from_str(text)?;
+                assert_eq!(
+                    response["result"]["repository_root"],
+                    json!(pool.repository)
+                );
+                assert_eq!(response["result"]["head_commit"], expected_commit);
+                assert_eq!(response["result"]["target"], target);
+                assert_eq!(response["result"]["target_exists"], expected);
+            } else {
+                assert_eq!(content["is_error"], true);
+                assert!(text.contains("one top-level name"));
+            }
+        }
+        assert_eq!(store.workspace_resource_epoch().await?, epoch);
+        assert!(!pool.directory.join("slot-0000").exists());
+        assert!(!pool.repository.join("expense-summary").exists());
+        assert!(store.uncertain_jobs("root".into(), 1).await?.is_empty());
         store.shutdown().await
     }
 
