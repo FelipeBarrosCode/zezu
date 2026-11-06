@@ -39,6 +39,7 @@
 //! To ease trusting multiple directory worktrees at once, it's possible to trust a parent directory of a certain directory worktree opened in Zed.
 //! Trusting a directory means trusting all its subdirectories as well, including all current and potential directory worktrees.
 
+use anyhow::{Result, ensure};
 use client::ProjectId;
 use collections::{HashMap, HashSet};
 use gpui::{
@@ -51,7 +52,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use util::debug_panic;
+use util::{debug_panic, paths::SanitizedPath};
 
 use crate::{project_settings::ProjectSettings, worktree_store::WorktreeStore};
 
@@ -137,7 +138,14 @@ pub struct TrustedWorktreesStore {
     db_trusted_paths: DbTrustedPaths,
     trusted_paths: TrustedPaths,
     restricted: HashMap<WeakEntity<WorktreeStore>, HashSet<WorktreeId>>,
+    inherited_trust: HashMap<WeakEntity<WorktreeStore>, InheritedWorktreeTrust>,
     worktree_trust_serialization: Task<()>,
+}
+
+#[derive(Debug)]
+struct InheritedWorktreeTrust {
+    source: WeakEntity<WorktreeStore>,
+    path: Arc<Path>,
 }
 
 #[derive(Debug, Default)]
@@ -241,6 +249,7 @@ impl TrustedWorktreesStore {
             trusted_paths: HashMap::default(),
             worktree_stores: HashMap::default(),
             restricted: HashMap::default(),
+            inherited_trust: HashMap::default(),
             worktree_trust_serialization: Task::ready(()),
         }
     }
@@ -251,6 +260,56 @@ impl TrustedWorktreesStore {
         worktree_store: &Entity<WorktreeStore>,
         cx: &App,
     ) -> bool {
+        self.has_explicit_restrictions(worktree_store, cx)
+            || self
+                .inherited_trust
+                .get(&worktree_store.downgrade())
+                .is_some_and(|trust| !self.inherited_source_is_trusted(trust, cx))
+    }
+
+    pub fn inherit_local_worktree_trust(
+        &mut self,
+        derived: &Entity<WorktreeStore>,
+        source: &Entity<WorktreeStore>,
+        path: &Path,
+        cx: &App,
+    ) -> Result<()> {
+        self.inherited_trust
+            .retain(|worktree_store, _| worktree_store.is_upgradable());
+        let derived_key = derived.downgrade();
+        let source_key = source.downgrade();
+        ensure!(
+            derived != source
+                && path.is_absolute()
+                && derived.read(cx).worktrees().next().is_none()
+                && !self.worktree_stores.contains_key(&derived_key)
+                && !self.inherited_trust.contains_key(&derived_key)
+                && !self.inherited_trust.contains_key(&source_key),
+            "trust inheritance requires a new worktree store and a separate source project"
+        );
+        ensure!(
+            !self.has_explicit_restrictions(source, cx),
+            "source project is restricted"
+        );
+        // A lease path can be reused, so keep this relationship out of saved trust.
+        self.inherited_trust.insert(
+            derived_key,
+            InheritedWorktreeTrust {
+                source: source_key,
+                path: SanitizedPath::cast_arc(SanitizedPath::new_arc(path)),
+            },
+        );
+        Ok(())
+    }
+
+    fn inherited_source_is_trusted(&self, trust: &InheritedWorktreeTrust, cx: &App) -> bool {
+        trust
+            .source
+            .upgrade()
+            .is_some_and(|source| !self.has_explicit_restrictions(&source, cx))
+    }
+
+    fn has_explicit_restrictions(&self, worktree_store: &Entity<WorktreeStore>, cx: &App) -> bool {
         self.restricted
             .get(&worktree_store.downgrade())
             .is_some_and(|restricted_worktrees| {
@@ -487,6 +546,12 @@ impl TrustedWorktreesStore {
             .is_some_and(|restricted_worktrees| restricted_worktrees.contains(&worktree_id))
         {
             return false;
+        }
+
+        if let Some(trust) = self.inherited_trust.get(&weak_worktree_store)
+            && trust.path == worktree_path
+        {
+            return self.inherited_source_is_trusted(trust, cx);
         }
 
         if self

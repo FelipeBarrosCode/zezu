@@ -77,12 +77,7 @@ impl RuntimeToolContext {
     }
 
     pub fn definitions(&self, cx: &App) -> Vec<ToolDefinition> {
-        let restricted =
-            TrustedWorktrees::has_restricted_worktrees(&self.project.read(cx).worktree_store(), cx)
-                || TrustedWorktrees::has_restricted_worktrees(
-                    &self.trust_source.read(cx).worktree_store(),
-                    cx,
-                );
+        let restricted = self.workspace_restriction(cx).is_some();
         let mut definitions: Vec<_> = self
             .tools
             .iter()
@@ -103,6 +98,26 @@ impl RuntimeToolContext {
                 .cloned(),
         );
         definitions
+    }
+
+    fn workspace_restriction(&self, cx: &App) -> Option<&'static str> {
+        if TrustedWorktrees::has_restricted_worktrees(
+            &self.trust_source.read(cx).worktree_store(),
+            cx,
+        ) {
+            Some(
+                "The source project is in Restricted Mode. Trust the source project in its Zezu window before retrying.",
+            )
+        } else if TrustedWorktrees::has_restricted_worktrees(
+            &self.project.read(cx).worktree_store(),
+            cx,
+        ) {
+            Some(
+                "The isolated workspace is restricted. Reopen the source project and acquire a fresh workspace.",
+            )
+        } else {
+            None
+        }
     }
 }
 
@@ -399,20 +414,12 @@ async fn execute_job(
         .any(|definition| definition.name == name)
     {
         if requires_workspace_trust(name)
-            && cx.update(|cx| {
-                TrustedWorktrees::has_restricted_worktrees(
-                    &context.project.read(cx).worktree_store(),
-                    cx,
-                ) || TrustedWorktrees::has_restricted_worktrees(
-                    &context.trust_source.read(cx).worktree_store(),
-                    cx,
-                )
-            })
+            && let Some(message) = cx.update(|cx| context.workspace_restriction(cx))
         {
             store
                 .complete_tool_job(
                     job,
-                    vec![json!({"type":"text","text":"workspace has become restricted"})],
+                    vec![json!({"type":"text","text":message})],
                     true,
                     Value::Null,
                 )
@@ -475,17 +482,11 @@ async fn execute_job(
             tool.supports_provider(&context.provider_id),
             "tool does not support the selected provider"
         );
-        ensure!(
-            tool.allow_in_restricted_mode()
-                || (!TrustedWorktrees::has_restricted_worktrees(
-                    &context.project.read(cx).worktree_store(),
-                    cx
-                ) && !TrustedWorktrees::has_restricted_worktrees(
-                    &context.trust_source.read(cx).worktree_store(),
-                    cx
-                )),
-            "workspace has become restricted"
-        );
+        if !tool.allow_in_restricted_mode()
+            && let Some(message) = context.workspace_restriction(cx)
+        {
+            anyhow::bail!("{message}");
+        }
         let (events, receiver) = ToolCallEventStream::for_runtime(
             call_id.into(),
             job.id.clone(),

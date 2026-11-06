@@ -58,6 +58,7 @@ pub fn definitions(workspaces: bool) -> Vec<ToolDefinition> {
     ];
     if workspaces {
         tools.extend([
+            definition("runtime_workspace_preflight", "Read the current source Git repository root and HEAD commit before acquiring a workspace or launching children. Optionally check whether a top-level target already exists in the source checkout, including untracked entries. Pass the name without slashes, for example expense-summary.",json!({"target":{"type":"string","minLength":1,"maxLength":255}}),&[]),
             definition("runtime_workspace_acquire", "Acquire an isolated editing workspace from the configured bounded pool. A null result means every workspace is currently leased.",json!({"base_ref":{"type":"string"}}),&[]),
             definition("runtime_workspace_checkpoint", "Commit edits in your leased workspace to a durable recoverable artifact before releasing it.",json!({"lease":{"type":"object"},"message":{"type":"string"}}),&["lease","message"]),
             definition("runtime_workspace_release", "Release your clean checkpointed workspace back to the bounded pool. Dirty workspaces are preserved and cannot be released.",json!({"lease":{"type":"object"}}),&["lease"]),
@@ -99,10 +100,12 @@ pub async fn dispatch_runtime_job_with_integration(
         .get("tool")
         .and_then(Value::as_str)
         .context("job tool name")?;
-    if name != "runtime_workspace_acquire"
-        && !definitions_with_integration(workspace.is_some(), integration.is_some())
-            .iter()
-            .any(|tool| tool.name == name)
+    if !matches!(
+        name,
+        "runtime_workspace_acquire" | "runtime_workspace_preflight"
+    ) && !definitions_with_integration(workspace.is_some(), integration.is_some())
+        .iter()
+        .any(|tool| tool.name == name)
     {
         return Ok(false);
     }
@@ -357,6 +360,36 @@ pub async fn dispatch_runtime_job_with_integration(
                     .revert(arguments.integration_id, policy.checks)
                     .await?,
             )?
+        }
+        "runtime_workspace_preflight" => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Arguments {
+                target: Option<String>,
+            }
+            let arguments: Arguments = match serde_json::from_value(arguments) {
+                Ok(arguments) => arguments,
+                Err(_) => {
+                    return reject_tool(
+                        &store,
+                        job,
+                        "runtime_workspace_preflight accepts an optional top-level target name.",
+                    )
+                    .await;
+                }
+            };
+            let Some(workspace) = workspace else {
+                return reject_tool(
+                    &store,
+                    job,
+                    "Source repository preflight is unavailable. Open a trusted project repository with a commit, then reopen the conversation.",
+                )
+                .await;
+            };
+            match workspace.source_preflight(arguments.target).await {
+                Ok(preflight) => serde_json::to_value(preflight)?,
+                Err(error) => return reject_tool(&store, job, &error.to_string()).await,
+            }
         }
         "runtime_workspace_acquire" => {
             #[derive(Deserialize)]

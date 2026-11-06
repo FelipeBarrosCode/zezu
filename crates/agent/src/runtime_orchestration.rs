@@ -108,18 +108,25 @@ pub fn append_runtime_instructions(prompt: &mut String, services: &RuntimeOrches
         services.store.limits().max_tool_calls_per_response(),
     ));
     if services.workspace.is_some() {
+        prompt.push_str("Use runtime_workspace_preflight to check the original repository root, HEAD, and whether a top-level target already exists. It does not require a lease. Terminal commands after acquisition run in the isolated checkout.\n");
         prompt.push_str("Before modifying project files, acquire your editing lease with runtime_workspace_acquire. All editing and terminal operations must target that leased project. Preserve the lease response for checkpoint and release. Checkpoint edits with runtime_workspace_checkpoint, then release a clean workspace with runtime_workspace_release. Do not create or delete worktrees manually.\n");
+        prompt.push_str("For delegated edits, ask each child to report its changed paths, checkpoint artifact ID, and any integration result. A successful edit saves to the leased checkout. A checkpoint saves a Git artifact. Verify successful integration into the intended branch before reporting that files landed in the original checkout.\n");
     } else if let Some(error) = &services.workspace_error {
         prompt.push_str(&format!(
             "Editing workspaces are unavailable for this project. {error}\n"
         ));
     }
-    if services
-        .integration
-        .as_ref()
-        .is_some_and(|policy| policy.auto_integrate)
-    {
-        prompt.push_str("When your profile permits integration, workspace checkpoints automatically run the user's configured checks and integrate into the configured target branch. Check commands and destination are application settings. Inspect the returned integration status; report failed checks or conflicts instead of bypassing them. runtime_revert selectively reverses an integration with validation.\n");
+    match &services.integration {
+        Some(policy) if policy.auto_integrate => {
+            prompt.push_str("When your profile permits integration, workspace checkpoints automatically run the user's configured checks and integrate into the configured target branch. Check commands and destination are application settings. Inspect the returned integration status; report failed checks or conflicts instead of bypassing them. runtime_revert selectively reverses an integration with validation.\n");
+        }
+        Some(_) => {
+            prompt.push_str("Use runtime_integrate with a checkpoint artifact ID to apply it through the configured checks when the task calls for publishing changes.\n");
+        }
+        None if services.workspace.is_some() => {
+            prompt.push_str("Publishing to the source checkout requires configured agent.runtime.integration_checks. Report checkpoint artifact IDs so the user can recover the saved changes.\n");
+        }
+        None => {}
     }
 }
 
@@ -131,6 +138,12 @@ pub fn runtime_tool_enabled(profile: &AgentProfileSettings, name: &str) -> bool 
         "runtime_spawn" | "runtime_wait" => profile.is_tool_enabled("spawn_agent"),
         "runtime_report" | "runtime_reports" => {
             profile.is_tool_enabled("read_file") || profile.is_tool_enabled("spawn_agent")
+        }
+        "runtime_workspace_preflight" => {
+            profile.is_tool_enabled("read_file")
+                || profile.is_tool_enabled("edit_file")
+                || profile.is_tool_enabled("write_file")
+                || profile.is_tool_enabled("spawn_agent")
         }
         "runtime_workspace_acquire"
         | "runtime_workspace_checkpoint"
@@ -187,10 +200,12 @@ pub fn with_runtime_orchestration(
             &context.project.read(cx).worktree_store(),
             cx,
         );
-        let acquiring_workspace = job.payload.get("tool").and_then(serde_json::Value::as_str)
-            == Some("runtime_workspace_acquire");
+        let needs_workspace_diagnostic = matches!(
+            job.payload.get("tool").and_then(serde_json::Value::as_str),
+            Some("runtime_workspace_acquire" | "runtime_workspace_preflight")
+        );
         let definitions = definitions_with_integration(
-            (services.workspace.is_some() || acquiring_workspace) && !restricted,
+            (services.workspace.is_some() || needs_workspace_diagnostic) && !restricted,
             services.integration.is_some() && !restricted,
         )
         .into_iter()
@@ -228,7 +243,9 @@ pub fn with_runtime_orchestration(
                         enabled.iter().any(|enabled| enabled == name),
                         "internal tool is disabled by the selected profile"
                     );
-                    if (name.starts_with("runtime_workspace_") && services.workspace.is_some())
+                    if (name.starts_with("runtime_workspace_")
+                        && name != "runtime_workspace_preflight"
+                        && services.workspace.is_some())
                         || matches!(name, "runtime_integrate" | "runtime_revert")
                     {
                         authorize_effect(
@@ -383,6 +400,7 @@ mod tests {
     fn readonly_mcp_profiles_can_use_leases_without_native_edit_or_integration() {
         let mut profile = readonly_profile();
         for tool in [
+            "runtime_workspace_preflight",
             "runtime_workspace_acquire",
             "runtime_workspace_checkpoint",
             "runtime_workspace_release",
