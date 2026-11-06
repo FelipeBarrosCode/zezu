@@ -7,7 +7,7 @@ use agent_runtime::{
         RuntimeIntegration, definitions_with_integration, dispatch_runtime_job_with_integration,
     },
     resource::RuntimeResources,
-    workspaces::WorkspacePool,
+    workspaces::{InvalidWorkspace, WorkspacePool},
 };
 use agent_settings::{AgentProfileId, AgentProfileSettings, AgentSettings};
 use anyhow::{Context as _, Result, ensure};
@@ -26,6 +26,7 @@ use crate::{
 pub struct RuntimeOrchestrationServices {
     pub store: RuntimeStore,
     pub workspace: Option<WorkspacePool>,
+    pub workspace_error: Option<String>,
     pub integration: Option<RuntimeIntegration>,
     _quit: Option<Rc<Subscription>>,
 }
@@ -35,6 +36,7 @@ impl RuntimeOrchestrationServices {
         Self {
             store,
             workspace: None,
+            workspace_error: None,
             integration: None,
             _quit: None,
         }
@@ -59,7 +61,17 @@ pub fn prepare_runtime_orchestration(
     let settings = AgentSettings::get_global(cx).runtime.clone();
     let capacity = resources.limits().max_workspaces;
     cx.spawn(async move |cx| {
-        let workspace=WorkspacePool::open(store.clone(),repository.clone(),pool_directory,capacity).await?.with_resources(resources);
+        let workspace = match WorkspacePool::open(store.clone(), repository.clone(), pool_directory, capacity).await {
+            Ok(workspace) => workspace.with_resources(resources),
+            Err(error) if error.is::<InvalidWorkspace>() => {
+                log::warn!("runtime editing workspace is unavailable: {error:#}");
+                return Ok(RuntimeOrchestrationServices {
+                    workspace_error: Some(error.to_string()),
+                    ..RuntimeOrchestrationServices::metadata_only(store)
+                });
+            }
+            Err(error) => return Err(error),
+        };
         let recovered=workspace.recover().await?;
         if !recovered.is_empty() {log::warn!("{} editing workspaces require explicit recovery",recovered.len());}
         let checks=settings.integration_checks.unwrap_or_default();
@@ -85,7 +97,7 @@ pub fn prepare_runtime_orchestration(
             if let Some(integration)=&integration_shutdown {integration.request_shutdown();}
             async {}
         }))));
-        Ok(RuntimeOrchestrationServices {store,workspace:Some(workspace),integration,_quit:quit})
+        Ok(RuntimeOrchestrationServices {store,workspace:Some(workspace),workspace_error:None,integration,_quit:quit})
     })
 }
 
@@ -97,6 +109,10 @@ pub fn append_runtime_instructions(prompt: &mut String, services: &RuntimeOrches
     ));
     if services.workspace.is_some() {
         prompt.push_str("Before modifying project files, acquire your editing lease with runtime_workspace_acquire. All editing and terminal operations must target that leased project. Preserve the lease response for checkpoint and release. Checkpoint edits with runtime_workspace_checkpoint, then release a clean workspace with runtime_workspace_release. Do not create or delete worktrees manually.\n");
+    } else if let Some(error) = &services.workspace_error {
+        prompt.push_str(&format!(
+            "Editing workspaces are unavailable for this project. {error}\n"
+        ));
     }
     if services
         .integration
@@ -155,6 +171,11 @@ pub fn with_runtime_orchestration(
         let mut context = resolver(job, snapshot, cx)?;
         context.tools.remove("spawn_agent");
         context.tools.remove("create_thread");
+        if services.workspace_error.is_some() {
+            context
+                .tools
+                .retain(|name, _| !crate::runtime_workspaces::requires_workspace(name));
+        }
         let requested_profile = authoritative_profile(job, &profile_id)?;
         let (effective_profile_id, _) =
             Thread::profile_for_restricted_workspace(requested_profile, &context.project, cx);
@@ -166,8 +187,10 @@ pub fn with_runtime_orchestration(
             &context.project.read(cx).worktree_store(),
             cx,
         );
+        let acquiring_workspace = job.payload.get("tool").and_then(serde_json::Value::as_str)
+            == Some("runtime_workspace_acquire");
         let definitions = definitions_with_integration(
-            services.workspace.is_some() && !restricted,
+            (services.workspace.is_some() || acquiring_workspace) && !restricted,
             services.integration.is_some() && !restricted,
         )
         .into_iter()
@@ -205,7 +228,7 @@ pub fn with_runtime_orchestration(
                         enabled.iter().any(|enabled| enabled == name),
                         "internal tool is disabled by the selected profile"
                     );
-                    if name.starts_with("runtime_workspace_")
+                    if (name.starts_with("runtime_workspace_") && services.workspace.is_some())
                         || matches!(name, "runtime_integrate" | "runtime_revert")
                     {
                         authorize_effect(

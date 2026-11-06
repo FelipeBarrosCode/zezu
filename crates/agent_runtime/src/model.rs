@@ -324,7 +324,7 @@ impl ModelProvider for ZedModelProvider {
     }
 }
 
-fn serialized_size(value: &impl Serialize) -> Result<usize> {
+pub(crate) fn serialized_size(value: &impl Serialize) -> Result<usize> {
     struct Counter(usize);
     impl std::io::Write for Counter {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
