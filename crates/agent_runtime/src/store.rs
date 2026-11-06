@@ -581,7 +581,12 @@ impl RuntimeStore {
         .await
     }
 
-    pub async fn complete_job(&self, id: String, input: Value) -> Result<bool> {
+    pub async fn complete_job(&self, id: String, mut input: Value) -> Result<bool> {
+        if input.pointer("/content/type").and_then(Value::as_str) == Some("toolresult") {
+            crate::jobs::bound_tool_result(&mut input, self.limits().max_input_bytes)?;
+            let _: infinity_agent_core::message::InputMessage =
+                serde_json::from_value(input.clone())?;
+        }
         let payload = self.encode(&input)?;
         self.write(move |connection| {
             let transaction = connection.transaction()?;

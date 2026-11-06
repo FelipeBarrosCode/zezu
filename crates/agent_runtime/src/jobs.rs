@@ -2,7 +2,81 @@ use anyhow::{Result, ensure};
 use rusqlite::params;
 use serde_json::{Value, json};
 
-use crate::{Job, JobState, RuntimeStore};
+use crate::{Job, JobState, RuntimeStore, model::serialized_size};
+
+const TOOL_RESULT_PREVIEW_BYTES: usize = 64 * 1024;
+const TOOL_RESULT_METADATA_BYTES: usize = 512;
+
+pub(crate) fn bound_tool_result(input: &mut Value, maximum_bytes: usize) -> Result<()> {
+    let original_bytes = serialized_size(input)?;
+    if original_bytes <= maximum_bytes {
+        return Ok(());
+    }
+
+    let original_content = input["content"]["content"].take();
+    let raw_output = input["content"]["output"].take();
+    input["content"]["content"] = json!([]);
+    let envelope_bytes = serialized_size(input)?;
+    let preview_budget =
+        maximum_bytes.min(envelope_bytes.saturating_add(TOOL_RESULT_PREVIEW_BYTES));
+    let mut preview = format!(
+        "Tool output truncated. The serialized result was {original_bytes} bytes and exceeded the runtime limit of {maximum_bytes} bytes. Inspect the existing terminal output or request a smaller chunk of the source if needed."
+    );
+    input["content"]["output"] = tool_result_metadata(raw_output)?;
+    input["content"]["content"] = json!([{"type":"text","text":preview}]);
+    if serialized_size(input)? > preview_budget {
+        preview = "Tool output truncated.".into();
+        input["content"]["content"] = json!([{"type":"text","text":preview}]);
+    }
+    if serialized_size(input)? > preview_budget {
+        input["content"]["output"] = Value::Null;
+    }
+    if serialized_size(input)? > preview_budget {
+        input["content"]["content"] = json!([]);
+        return Ok(());
+    }
+
+    // A source byte expands to at most six bytes after JSON escaping.
+    let mut remaining = (preview_budget - serialized_size(input)?) / 6;
+    for block in original_content.as_array().into_iter().flatten() {
+        let Some(text) = block.get("text").and_then(Value::as_str) else {
+            continue;
+        };
+        let length = text.floor_char_boundary(remaining.saturating_sub(2));
+        if length > 0 {
+            preview.push_str("\n\n");
+            preview.push_str(&text[..length]);
+            remaining -= length + 2;
+        }
+        if length < text.len() {
+            break;
+        }
+    }
+    input["content"]["content"] = json!([{"type":"text","text":preview}]);
+    Ok(())
+}
+
+fn tool_result_metadata(raw_output: Value) -> Result<Value> {
+    if serialized_size(&raw_output)? <= TOOL_RESULT_METADATA_BYTES {
+        return Ok(raw_output);
+    }
+    let mut metadata = json!({"truncated":true});
+    for key in [
+        "exit_code",
+        "exit_status",
+        "status",
+        "signal",
+        "timed_out",
+        "cancelled",
+    ] {
+        if let Some(value) = raw_output.get(key)
+            && serialized_size(value)? <= TOOL_RESULT_METADATA_BYTES
+        {
+            metadata[key] = value.clone();
+        }
+    }
+    Ok(metadata)
+}
 
 pub(crate) fn initialize_connection(connection: &rusqlite::Connection) -> Result<()> {
     connection.execute_batch("CREATE TABLE IF NOT EXISTS runtime_job_events(sequence INTEGER PRIMARY KEY AUTOINCREMENT,job_id TEXT NOT NULL REFERENCES jobs(id),kind TEXT NOT NULL,payload TEXT NOT NULL); CREATE INDEX IF NOT EXISTS runtime_job_events_job ON runtime_job_events(job_id,sequence); CREATE TABLE IF NOT EXISTS runtime_resource_waits(job_id TEXT PRIMARY KEY REFERENCES jobs(id),kind TEXT NOT NULL);")?;
@@ -210,12 +284,13 @@ impl RuntimeStore {
             .get("tool_call_id")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("job has no tool call identity"))?;
-        let input = json!({
+        let mut input = json!({
             "group_id":job.agent_id,
-            "content":{"type":"toolresult","id":call_id,"call_id":job.payload.get("provider_call_id"),"content":content,"is_error":is_error,"output":raw_output},
+            "content":{"type":"toolresult","id":call_id,"call_id":job.payload.get("provider_call_id"),"is_error":is_error},
             "metadata":null,
         });
-        let _: infinity_agent_core::message::InputMessage = serde_json::from_value(input.clone())?;
+        input["content"]["content"] = Value::Array(content);
+        input["content"]["output"] = raw_output;
         self.complete_job(job.id, input).await
     }
 }
@@ -579,7 +654,87 @@ mod tests {
             .result
             .ok_or_else(|| anyhow::anyhow!("result"))?;
         assert_eq!(result["content"]["id"], "call");
+        assert_eq!(
+            result["content"]["content"],
+            json!([{"type":"text","text":"done"}])
+        );
         assert!(store.queued_jobs(257).await.is_err());
         store.shutdown().await
+    }
+
+    #[tokio::test]
+    async fn oversized_tool_results_complete_with_bounded_output_and_preserve_status() -> Result<()>
+    {
+        for (is_error, exit_code) in [(false, 0), (true, 23)] {
+            let directory = tempfile::tempdir()?;
+            let limits = RuntimeLimits {
+                max_input_bytes: 1024,
+                ..RuntimeLimits::default()
+            };
+            let store = RuntimeStore::open(directory.path().join("jobs.sqlite"), limits.clone())?;
+            store.create_root("agent".into(), json!({})).await?;
+            store
+                .enqueue_text_input("agent".into(), "input".into(), "run".into())
+                .await?;
+            let lease = store
+                .admit()
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("lease"))?;
+            store
+                .record_job(
+                    lease.clone(),
+                    "job".into(),
+                    json!({"tool":"terminal","arguments":{},"tool_call_id":"call","provider_call_id":"provider-call"}),
+                )
+                .await?;
+            store
+                .finish(lease, json!({}), crate::SliceOutcome::Waiting)
+                .await?;
+            let job = store.dispatch_job("job".into()).await?;
+            let output = format!(
+                "Command exited with code {exit_code}.\n{}",
+                "\"\0🦀".repeat(1024)
+            );
+            let content = vec![json!({"type":"text","text":output})];
+            let raw_output = json!({"output":output,"exit_status":{"exit_code":exit_code}});
+            assert!(
+                store
+                    .complete_tool_job(job.clone(), content.clone(), is_error, raw_output.clone())
+                    .await?
+            );
+            assert!(
+                !store
+                    .complete_tool_job(job, content, is_error, raw_output)
+                    .await?
+            );
+
+            let job = store.job("job".into()).await?;
+            assert_eq!(job.state, JobState::Completed);
+            assert!(store.uncertain_jobs("agent".into(), 1).await?.is_empty());
+            let result = job.result.ok_or_else(|| anyhow::anyhow!("result"))?;
+            assert!(serialized_size(&result)? <= limits.max_input_bytes);
+            assert_eq!(result["content"]["id"], "call");
+            assert_eq!(result["content"]["call_id"], "provider-call");
+            assert_eq!(result["content"]["is_error"], is_error);
+            assert_eq!(
+                result["content"]["output"]["exit_status"]["exit_code"],
+                exit_code
+            );
+            assert_eq!(result["content"]["output"]["truncated"], true);
+            let preview = result["content"]["content"][0]["text"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("text preview"))?;
+            assert!(preview.contains("Tool output truncated."));
+            assert!(preview.contains(&format!("Command exited with code {exit_code}.")));
+            assert!(preview.contains('🦀'));
+
+            let lease = store
+                .admit()
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("tool result lease"))?;
+            assert_eq!(lease.inputs, vec![("job:job:result".into(), result)]);
+            store.shutdown().await?;
+        }
+        Ok(())
     }
 }

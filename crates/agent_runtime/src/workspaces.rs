@@ -16,6 +16,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::{RuntimeStore, orchestration::TaskIdentity};
 
+#[derive(Debug)]
+pub struct InvalidWorkspace(String);
+
+impl std::fmt::Display for InvalidWorkspace {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for InvalidWorkspace {}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkspaceLease {
     pub slot_id: i64,
@@ -76,19 +87,27 @@ impl WorkspacePool {
             "workspace capacity must be between 1 and 4096"
         );
         let (repository, directory) = blocking(move |cancelled| {
-            let repository = repository.canonicalize()?;
-            let actual = git(&repository, &["rev-parse", "--show-toplevel"], &cancelled)?;
+            let invalid_root = || {
+                InvalidWorkspace(format!(
+                    "Open the Git repository root for your project. {} is not a usable repository root.",
+                    repository.display()
+                ))
+            };
+            let canonical = repository.canonicalize().with_context(invalid_root)?;
+            let actual = git(&canonical, &["rev-parse", "--show-toplevel"], &cancelled)
+                .with_context(invalid_root)?;
             ensure!(
-                Path::new(actual.trim()).canonicalize()? == repository,
-                "workspace repository must be its top-level directory"
+                Path::new(actual.trim()).canonicalize().with_context(invalid_root)? == canonical,
+                invalid_root()
             );
+            resolve_base_commit(&canonical, "HEAD", &cancelled)?;
             std::fs::create_dir_all(&directory)?;
             let directory = directory.canonicalize()?;
             ensure!(
-                !directory.starts_with(&repository),
+                !directory.starts_with(&canonical),
                 "workspace pool must be outside the source worktree"
             );
-            Ok((repository, directory))
+            Ok((canonical, directory))
         })
         .await?;
         let permits = shared_permits(&directory)?;
@@ -229,28 +248,28 @@ impl WorkspacePool {
         task: TaskIdentity,
         base_ref: String,
     ) -> Result<Option<WorkspaceLease>> {
-        self.recover().await?;
         let recoverable = {
             let repository_key = self.repository_key()?;
             let owner = task.clone();
             self.store.read(move |connection| {
                 let resumed:bool=connection.query_row("SELECT EXISTS(SELECT 1 FROM agents WHERE id=? AND generation=? AND pause_requested=0 AND state IN ('queued','running','waiting'))",params![owner.agent_id,owner.generation],|row|row.get(0))?;
                 ensure!(resumed,"resume the task before acquiring its editing workspace");
-                connection.query_row("SELECT slot,agent_id,generation,token,path,base_commit FROM runtime_workspaces WHERE repository=? AND agent_id=? AND generation<? AND state IN ('uncertain','leased','busy') LIMIT 1",params![repository_key,owner.agent_id,owner.generation],lease_row).optional().map_err(Into::into)
+                connection.query_row("SELECT slot,agent_id,generation,token,path,base_commit FROM runtime_workspaces WHERE repository=? AND agent_id=? AND generation<? AND state IN ('creating','uncertain','leased','busy') LIMIT 1",params![repository_key,owner.agent_id,owner.generation],lease_row).optional().map_err(Into::into)
             }).await?
         };
         if let Some(old) = recoverable {
-            let old = old.clone();
-            let repository_key = self.repository_key()?;
-            let slot = old.slot_id;
-            let token = old.token.clone();
-            self.store.write(move |connection| {connection.execute("UPDATE runtime_workspaces SET state='uncertain' WHERE repository=? AND slot=? AND token=?",params![repository_key,slot,token])?;Ok(())}).await?;
+            self.recover().await?;
             return Ok(Some(self.resume_lease(old, task).await?));
         }
         if let Some(lease) = self.store.workspace_lease_for_task(task.clone()).await? {
             self.validate_path(&lease)?;
             return Ok(Some(lease));
         }
+        let repository = self.repository.clone();
+        let base_commit = self
+            .run_operation(move |cancelled| resolve_base_commit(&repository, &base_ref, &cancelled))
+            .await?;
+        self.recover().await?;
         self.reclaim_finished().await?;
         let permit = match &self.resources {
             Some(resources) => {
@@ -261,22 +280,6 @@ impl WorkspacePool {
             }
             None => None,
         };
-        let repository = self.repository.clone();
-        let base_commit = self
-            .run_operation(move |cancelled| {
-                git(
-                    &repository,
-                    &[
-                        "rev-parse",
-                        "--verify",
-                        "--end-of-options",
-                        &format!("{base_ref}^{{commit}}"),
-                    ],
-                    &cancelled,
-                )
-                .map(|value| value.trim().to_owned())
-            })
-            .await?;
         let repository_key = self.repository_key()?;
         let capacity = self.capacity;
         let lease = self.store.write(move |connection| {
@@ -836,6 +839,42 @@ async fn blocking_with_stop<T: Send + 'static>(
 
 struct GitProcess(std::process::Child);
 
+fn resolve_base_commit(
+    repository: &Path,
+    base_ref: &str,
+    cancelled: &impl CancellationFlag,
+) -> Result<String> {
+    ensure!(
+        !base_ref.is_empty() && !base_ref.contains('\0'),
+        InvalidWorkspace("Workspace base_ref must be a nonempty Git revision.".into())
+    );
+    git(
+        repository,
+        &[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{base_ref}^{{commit}}"),
+        ],
+        cancelled,
+    )
+    .map(|commit| commit.trim().to_owned())
+    .with_context(|| {
+        InvalidWorkspace(if base_ref == "HEAD" {
+            format!(
+                "Cannot resolve HEAD to a commit in {}. Open a project repository with a commit, or create the first commit in this repository.",
+                repository.display()
+            )
+        } else {
+            let revision = base_ref.chars().take(200).collect::<String>();
+            format!(
+                "Cannot resolve workspace base_ref {revision:?} to a commit in {}. Choose an existing Git commit or branch.",
+                repository.display()
+            )
+        })
+    })
+}
+
 impl Drop for GitProcess {
     fn drop(&mut self) {
         match self.0.try_wait() {
@@ -977,7 +1016,7 @@ fn git(repository: &Path, arguments: &[&str], cancelled: &impl CancellationFlag)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::RuntimeLimits;
+    use crate::{JobState, RuntimeLimits, SliceOutcome, orchestration_tools::dispatch_runtime_job};
     use serde_json::json;
 
     async fn fixture(capacity: usize) -> Result<(tempfile::TempDir, RuntimeStore, WorkspacePool)> {
@@ -1012,6 +1051,114 @@ mod tests {
         )
         .await?;
         Ok((directory, store, pool))
+    }
+
+    #[tokio::test]
+    async fn workspace_pool_rejects_unborn_repository_before_creating_slots() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let repository = directory.path().join("unborn");
+        let workspace_directory = directory.path().join("pool");
+        std::fs::create_dir(&repository)?;
+        git(&repository, &["init"], &AtomicBool::new(false))?;
+        let store = RuntimeStore::open(
+            directory.path().join("runtime.sqlite"),
+            RuntimeLimits::default(),
+        )?;
+
+        let Err(error) = WorkspacePool::open(
+            store.clone(),
+            repository.clone(),
+            workspace_directory.clone(),
+            1,
+        )
+        .await
+        else {
+            anyhow::bail!("an unborn repository cannot create an editing pool")
+        };
+        assert!(error.is::<InvalidWorkspace>());
+        let message = error.to_string();
+        assert!(message.contains(&repository.canonicalize()?.display().to_string()));
+        assert!(message.contains("first commit"));
+        assert!(!workspace_directory.exists());
+        store.shutdown().await
+    }
+
+    #[tokio::test]
+    async fn invalid_workspace_base_completes_tool_error_without_allocating_a_slot() -> Result<()> {
+        let (_directory, store, pool) = fixture(1).await?;
+        store.create_root("root".into(), json!({})).await?;
+        store
+            .enqueue_text_input("root".into(), "start".into(), "edit".into())
+            .await?;
+        let lease = store.admit().await?.context("initial slice")?;
+        let invalid_acquisitions = [
+            (
+                "missing",
+                json!("missing-revision"),
+                Some(pool.clone()),
+                "base_ref",
+            ),
+            ("malformed", json!(3), Some(pool.clone()), "base_ref"),
+            (
+                "unavailable",
+                json!("HEAD"),
+                None,
+                "Open a trusted project repository",
+            ),
+        ];
+        for (id, base_ref, _, _) in &invalid_acquisitions {
+            store
+                .record_job(
+                    lease.clone(),
+                    (*id).into(),
+                    json!({
+                        "tool":"runtime_workspace_acquire",
+                        "tool_call_id":id,
+                        "provider_call_id":format!("provider-{id}"),
+                        "arguments":{"base_ref":base_ref},
+                    }),
+                )
+                .await?;
+        }
+        store
+            .finish(lease, json!({}), SliceOutcome::Waiting)
+            .await?;
+        let epoch = store.workspace_resource_epoch().await?;
+        for (id, _, workspace, expected_message) in invalid_acquisitions {
+            let job = store.dispatch_job(id.into()).await?;
+            assert!(dispatch_runtime_job(store.clone(), job, workspace).await?);
+            let job = store.job(id.into()).await?;
+            assert_eq!(job.state, JobState::Completed);
+            let result = job.result.context("completed tool error")?;
+            assert_eq!(result["content"]["id"], id);
+            assert_eq!(result["content"]["call_id"], format!("provider-{id}"));
+            assert_eq!(result["content"]["is_error"], true);
+            assert!(
+                result["content"]["content"][0]["text"]
+                    .as_str()
+                    .context("validation message")?
+                    .contains(expected_message)
+            );
+        }
+        assert_eq!(store.workspace_resource_epoch().await?, epoch);
+        assert!(!pool.directory.join("slot-0000").exists());
+        assert!(store.uncertain_jobs("root".into(), 1).await?.is_empty());
+
+        let slice = store
+            .admit()
+            .await?
+            .context("agent resumes after tool errors")?;
+        assert_eq!(slice.inputs.len(), 3);
+        let task = TaskIdentity {
+            agent_id: "root".into(),
+            generation: 0,
+        };
+        let workspace = pool
+            .acquire(task, "HEAD".into())
+            .await?
+            .context("valid workspace")?;
+        assert!(workspace.path.exists());
+        store.shutdown().await
     }
 
     fn owner() -> TaskIdentity {

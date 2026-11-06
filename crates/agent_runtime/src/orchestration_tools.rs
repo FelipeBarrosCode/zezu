@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use crate::{
     Job, RuntimeStore,
     orchestration::{FailurePolicy, InvalidWait, Orchestrator, TaskIdentity, TaskResult},
-    workspaces::{WorkspaceLease, WorkspacePool},
+    workspaces::{InvalidWorkspace, WorkspaceLease, WorkspacePool},
 };
 
 #[derive(Clone)]
@@ -99,9 +99,10 @@ pub async fn dispatch_runtime_job_with_integration(
         .get("tool")
         .and_then(Value::as_str)
         .context("job tool name")?;
-    if !definitions_with_integration(workspace.is_some(), integration.is_some())
-        .iter()
-        .any(|tool| tool.name == name)
+    if name != "runtime_workspace_acquire"
+        && !definitions_with_integration(workspace.is_some(), integration.is_some())
+            .iter()
+            .any(|tool| tool.name == name)
     {
         return Ok(false);
     }
@@ -224,7 +225,7 @@ pub async fn dispatch_runtime_job_with_integration(
             let arguments: Arguments = match serde_json::from_value(arguments) {
                 Ok(arguments) => arguments,
                 Err(_) => {
-                    return reject_wait(
+                    return reject_tool(
                         &store,
                         job,
                         "runtime_wait requires a string key, a dependencies array of agent_id strings, and an optional boolean fail_fast",
@@ -247,7 +248,7 @@ pub async fn dispatch_runtime_job_with_integration(
             match status {
                 Ok(status) => serde_json::to_value(status)?,
                 Err(error) if error.is::<InvalidWait>() => {
-                    return reject_wait(&store, job, &error.to_string()).await;
+                    return reject_tool(&store, job, &error.to_string()).await;
                 }
                 Err(error) => return Err(error),
             }
@@ -363,17 +364,40 @@ pub async fn dispatch_runtime_job_with_integration(
             struct Arguments {
                 base_ref: Option<String>,
             }
-            let arguments: Arguments = serde_json::from_value(arguments)?;
-            let epoch = store.workspace_resource_epoch().await?;
-            let lease = workspace
-                .context("editing workspace pool is not configured")?
-                .acquire(task, arguments.base_ref.unwrap_or_else(|| "HEAD".into()))
-                .await?;
-            let Some(lease) = lease else {
-                store.park_workspace_job(job, epoch).await?;
-                return Ok(true);
+            let arguments: Arguments = match serde_json::from_value(arguments) {
+                Ok(arguments) => arguments,
+                Err(_) => {
+                    return reject_tool(
+                        &store,
+                        job,
+                        "runtime_workspace_acquire accepts an optional Git revision string in base_ref.",
+                    )
+                    .await;
+                }
             };
-            serde_json::to_value(lease)?
+            let Some(workspace) = workspace else {
+                return reject_tool(
+                    &store,
+                    job,
+                    "Editing workspaces are unavailable. Open a trusted project repository with a commit, then reopen the conversation.",
+                )
+                .await;
+            };
+            let epoch = store.workspace_resource_epoch().await?;
+            let acquisition = workspace
+                .acquire(task, arguments.base_ref.unwrap_or_else(|| "HEAD".into()))
+                .await;
+            match acquisition {
+                Ok(Some(lease)) => serde_json::to_value(lease)?,
+                Ok(None) => {
+                    store.park_workspace_job(job, epoch).await?;
+                    return Ok(true);
+                }
+                Err(error) if error.is::<InvalidWorkspace>() => {
+                    return reject_tool(&store, job, &error.to_string()).await;
+                }
+                Err(error) => return Err(error),
+            }
         }
         "runtime_workspace_checkpoint" => {
             #[derive(Deserialize)]
@@ -432,7 +456,7 @@ pub async fn dispatch_runtime_job_with_integration(
     Ok(true)
 }
 
-async fn reject_wait(store: &RuntimeStore, job: Job, message: &str) -> Result<bool> {
+async fn reject_tool(store: &RuntimeStore, job: Job, message: &str) -> Result<bool> {
     store
         .complete_tool_job(
             job,

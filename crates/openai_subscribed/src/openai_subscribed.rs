@@ -13,11 +13,11 @@ use language_model::{
     CompactionResult, LanguageModel, LanguageModelCompletionError, LanguageModelCompletionEvent,
     LanguageModelCompletionStream, LanguageModelEffortLevel, LanguageModelId, LanguageModelName,
     LanguageModelProviderId, LanguageModelProviderName, LanguageModelRequest,
-    LanguageModelToolChoiceSupport, RateLimiter,
+    LanguageModelToolChoiceSupport, ProviderErrorCategory, RateLimiter,
 };
 use open_ai::{
     ReasoningEffort,
-    responses::{ResponseInputItem, stream_response},
+    responses::{ResponseInputItem, stream_serialized_response},
 };
 use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
@@ -33,6 +33,8 @@ pub const PROVIDER_NAME: LanguageModelProviderName =
     LanguageModelProviderName::new("ChatGPT Subscription");
 
 const CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+// Bound the complete encoded body locally as well as checking the reported string limit.
+const CODEX_REQUEST_LIMIT: usize = 10 * 1024 * 1024;
 const OPENAI_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const OPENAI_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -579,6 +581,74 @@ fn codex_responses_request(
     Ok(responses_request)
 }
 
+fn encode_codex_request(
+    request: &open_ai::responses::Request,
+) -> Result<String, LanguageModelCompletionError> {
+    let body = serde_json::to_string(request).map_err(|error| {
+        LanguageModelCompletionError::SerializeRequest {
+            provider: PROVIDER_NAME,
+            error,
+        }
+    })?;
+    check_codex_request_size(&body, CODEX_REQUEST_LIMIT)?;
+    Ok(body)
+}
+
+fn check_codex_request_size(body: &str, limit: usize) -> Result<(), LanguageModelCompletionError> {
+    if body.len() <= limit {
+        return Ok(());
+    }
+
+    fn oversized_string(value: &serde_json::Value, limit: usize) -> Option<(String, usize)> {
+        match value {
+            serde_json::Value::String(text) if text.len() > limit => {
+                let characters = text.chars().count();
+                (characters > limit).then(|| (String::new(), characters))
+            }
+            serde_json::Value::Array(items) => {
+                items.iter().enumerate().find_map(|(index, item)| {
+                    let (path, characters) = oversized_string(item, limit)?;
+                    Some((format!("[{index}]{path}"), characters))
+                })
+            }
+            serde_json::Value::Object(fields) => fields.iter().find_map(|(field, value)| {
+                let (path, characters) = oversized_string(value, limit)?;
+                let field: String = field.chars().take(64).collect();
+                Some((format!(".{field}{path}"), characters))
+            }),
+            _ => None,
+        }
+    }
+
+    let field = match serde_json::from_str(body) {
+        Ok(value) => oversized_string(&value, limit),
+        Err(error) => {
+            log::debug!("Could not identify the largest ChatGPT request field: {error}");
+            None
+        }
+    };
+    let details = match field {
+        Some((path, characters)) => format!(
+            "field `{}` has {characters} characters (limit {limit})",
+            path.trim_start_matches('.')
+        ),
+        None => format!(
+            "the encoded body is {} bytes (local limit {limit})",
+            body.len()
+        ),
+    };
+    Err(LanguageModelCompletionError::from_provider_response(
+        PROVIDER_NAME,
+        None,
+        Some("local_request_too_large".into()),
+        format!(
+            "ChatGPT request is too large: {details}. Compact the conversation or reduce the input."
+        ),
+        None,
+        ProviderErrorCategory::PromptTooLarge { tokens: None },
+    ))
+}
+
 fn codex_extra_headers(
     credentials: &CodexCredentials,
     routing_cache_key: Option<&str>,
@@ -817,6 +887,12 @@ pub fn compact(
     responses_request
         .input
         .push(ResponseInputItem::CompactionTrigger);
+    let body = match encode_codex_request(&responses_request) {
+        Ok(body) => body,
+        Err(error) => return async move { Err(error) }.boxed(),
+    };
+    let routing_cache_key = responses_request.prompt_cache_key;
+    let is_streaming = responses_request.stream;
 
     let http_client = state.read_with(cx, |state, _| state.http_client.clone());
     let state = state.downgrade();
@@ -824,17 +900,17 @@ pub fn compact(
 
     cx.spawn(async move |cx| {
         let creds = get_fresh_credentials(&state, &http_client, cx).await?;
-        let extra_headers =
-            codex_extra_headers(&creds, responses_request.prompt_cache_key.as_deref());
+        let extra_headers = codex_extra_headers(&creds, routing_cache_key.as_deref());
         let access_token = creds.access_token.clone();
         let response_stream = request_limiter
             .stream(async move {
-                stream_response(
+                stream_serialized_response(
                     http_client.as_ref(),
                     PROVIDER_NAME.0.as_str(),
                     CODEX_BASE_URL,
                     &access_token,
-                    responses_request,
+                    body,
+                    is_streaming,
                     &extra_headers,
                 )
                 .await
@@ -890,6 +966,12 @@ pub fn stream_completion(
         Ok(responses_request) => responses_request,
         Err(error) => return async move { Err(error.into()) }.boxed(),
     };
+    let body = match encode_codex_request(&responses_request) {
+        Ok(body) => body,
+        Err(error) => return async move { Err(error) }.boxed(),
+    };
+    let routing_cache_key = responses_request.prompt_cache_key;
+    let is_streaming = responses_request.stream;
 
     let http_client = state.read_with(cx, |state, _| state.http_client.clone());
     let state = state.downgrade();
@@ -898,18 +980,18 @@ pub fn stream_completion(
 
     let future = cx.spawn(async move |cx| {
         let creds = get_fresh_credentials(&state, &http_client, cx).await?;
-        let extra_headers =
-            codex_extra_headers(&creds, responses_request.prompt_cache_key.as_deref());
+        let extra_headers = codex_extra_headers(&creds, routing_cache_key.as_deref());
 
         let access_token = creds.access_token.clone();
         request_limiter
             .stream(async move {
-                stream_response(
+                stream_serialized_response(
                     http_client.as_ref(),
                     PROVIDER_NAME.0.as_str(),
                     CODEX_BASE_URL,
                     &access_token,
-                    responses_request,
+                    body,
+                    is_streaming,
                     &extra_headers,
                 )
                 .await
@@ -1356,6 +1438,30 @@ mod tests {
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn codex_request_size_checks_the_encoded_body_and_individual_fields() {
+        let body = r#"{"input":[{"output":"ok"}]}"#;
+        check_codex_request_size(body, body.len()).expect("the exact limit is valid");
+
+        let error = check_codex_request_size(body, body.len() - 1).expect_err("oversized body");
+        assert!(matches!(
+            error,
+            LanguageModelCompletionError::ProviderRejection {
+                category: ProviderErrorCategory::PromptTooLarge { .. },
+                ..
+            }
+        ));
+        assert!(error.to_string().contains("the encoded body is"));
+
+        let error = check_codex_request_size(r#"{"input":[{"output":"ééééé"}]}"#, 4)
+            .expect_err("oversized tool output");
+        assert!(
+            error
+                .to_string()
+                .contains("`input[0].output` has 5 characters (limit 4)")
+        );
+    }
 
     #[gpui::test]
     async fn test_concurrent_refresh_deduplicates(cx: &mut TestAppContext) {

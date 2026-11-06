@@ -9,9 +9,10 @@ use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use futures::{FutureExt as _, StreamExt as _, future::BoxFuture};
 use gpui::{App, AsyncApp, Task};
 use language_model::{
-    CompactedContext, CompletionIntent, LanguageModel, LanguageModelCompletionEvent,
-    LanguageModelProvider, LanguageModelRegistry, LanguageModelRequest,
-    LanguageModelRequestMessage, LanguageModelToolChoice, MessageContent, Role, StopReason,
+    CompactedContext, CompletionIntent, LanguageModel, LanguageModelCompletionError,
+    LanguageModelCompletionEvent, LanguageModelProvider, LanguageModelRegistry,
+    LanguageModelRequest, LanguageModelRequestMessage, LanguageModelToolChoice, MessageContent,
+    ProviderErrorCategory, Role, StopReason,
 };
 use settings::Settings as _;
 
@@ -19,6 +20,8 @@ use crate::NativeRuntimeConfig;
 
 const MAXIMUM_PAGE_BYTES: usize = 32 * 1024 * 1024;
 const MAXIMUM_SUMMARY_BYTES: usize = 1024 * 1024;
+// Leave room for pending inputs, tool definitions and provider encoding.
+const CHATGPT_HISTORY_COMPACTION_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 pub enum CompactionMode {
@@ -65,19 +68,34 @@ pub(crate) fn compact_with_configuration(
         }
         if let Some(override_configuration) = configuration_override { configuration.system_prompt = override_configuration.system_prompt; }
         let (model, provider, template) = cx.update(|cx| prepare(&configuration, cx))?;
+        let history_request = snapshot.request;
         if model.supports_explicit_compaction() && !snapshot.overflow {
             let mut request = template.clone();
-            request.messages.extend(snapshot.request.messages);
+            request.messages.extend(history_request.messages);
             let bytes = serde_json::to_vec(&request)?.len();
             let execution = provider.compact(&model, request, cx);
-            let result = execute_fenced(&runtime, store.clone(), agent_id.clone(), generation, resources.clone(), bytes,
-                async move { Ok(execution.await?) }.boxed()).await?;
-            store.install_compaction(agent_id.clone(), generation, snapshot.cutoff, result.context).await?;
-            return Ok(());
+            match execute_fenced(&runtime, store.clone(), agent_id.clone(), generation, resources.clone(), bytes,
+                async move { Ok(execution.await?) }.boxed()).await {
+                Ok(result) => {
+                    store.install_compaction(agent_id.clone(), generation, snapshot.cutoff, result.context).await?;
+                    return Ok(());
+                }
+                Err(error) => {
+                    if !matches!(
+                        error.downcast_ref::<LanguageModelCompletionError>(),
+                        Some(LanguageModelCompletionError::ProviderRejection {
+                            category: ProviderErrorCategory::PromptTooLarge { .. },
+                            ..
+                        })
+                    ) {
+                        return Err(error);
+                    }
+                }
+            }
+        } else {
+            drop(history_request);
         }
 
-        // The fallback pages the archive independently; retain no second full decoded copy.
-        drop(snapshot.request);
         let chunk_bytes = usize::try_from(model.max_input_tokens().saturating_mul(2))?
             .clamp(4096, 2 * 1024 * 1024);
         let mut cursor = None;
@@ -182,6 +200,11 @@ pub fn maybe_compact_agent(
         model.max_output_tokens(),
     );
     let threshold = crate::thread::auto_compact_threshold_token_count(policy.threshold, capacity);
+    let history_byte_threshold = if model.provider_id().0.as_ref() == "openai-subscribed" {
+        CHATGPT_HISTORY_COMPACTION_BYTES
+    } else {
+        agent_runtime::history_budget::DEFAULT_HISTORY_BYTES
+    };
     cx.spawn(async move |cx| {
         let bytes = runtime
             .store
@@ -193,10 +216,7 @@ pub fn maybe_compact_agent(
             .store
             .provider_context_overflow(agent_id.clone())
             .await?;
-        if !overflow
-            && bytes < agent_runtime::history_budget::DEFAULT_HISTORY_BYTES
-            && used < threshold
-        {
+        if !overflow && bytes < history_byte_threshold && used < threshold {
             return Ok(());
         }
         cx.update(|cx| {

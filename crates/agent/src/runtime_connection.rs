@@ -173,7 +173,7 @@ impl NativeRuntimeConnection {
         project: Entity<Project>,
         configuration: NativeRuntimeConfig,
         cx: &mut App,
-    ) -> Task<Result<NativeRuntimeConfig>> {
+    ) -> Task<Result<(NativeRuntimeConfig, Option<String>)>> {
         let fs = self.fs.clone();
         let host = self.host.clone();
         let configurations = self.configurations.clone();
@@ -361,6 +361,7 @@ impl NativeRuntimeConnection {
             } else {
                 RuntimeOrchestrationServices::metadata_only(store.clone())
             };
+            let workspace_error = services.workspace_error.clone();
             append_runtime_instructions(&mut configuration.system_prompt, &services);
             let profile = prepared.profile_id;
             let runtime_profile = profile.clone();
@@ -485,7 +486,7 @@ impl NativeRuntimeConnection {
             skills
                 .borrow_mut()
                 .insert(catalog_job.agent_id, available_skills);
-            Ok(configuration)
+            Ok((configuration, workspace_error))
         })
     }
 
@@ -548,19 +549,28 @@ impl NativeRuntimeConnection {
                 let lease = store.begin_configuration(id.clone()).await?;
                 let prepared = cx.update(|cx| connection.register_project(id.clone(), project.clone(), configuration, cx)).await;
                 let result = match prepared {
-                    Ok(configuration) => match serde_json::to_value(configuration) {
-                        Ok(metadata) => store.commit_configuration(lease.clone(), metadata).await,
+                    Ok((configuration, workspace_error)) => match serde_json::to_value(configuration) {
+                        Ok(metadata) => store.commit_configuration(lease.clone(), metadata).await.map(|()| workspace_error),
                         Err(error) => Err(error.into()),
                     },
                     Err(error) => Err(error),
                 };
-                if let Err(error) = result {
-                    cx.update(|cx| connection.register_project(id.clone(), project, old_configuration, cx)).await
-                        .context("failed to restore the previous runtime binding; restart to recover the paused agent")?;
-                    store.abort_configuration(lease).await?;
-                    return Err(error);
-                }
+                let workspace_error = match result {
+                    Ok(workspace_error) => workspace_error,
+                    Err(error) => {
+                        cx.update(|cx| connection.register_project(id.clone(), project, old_configuration, cx)).await
+                            .context("failed to restore the previous runtime binding; restart to recover the paused agent")?;
+                        store.abort_configuration(lease).await?;
+                        return Err(error);
+                    }
+                };
                 cx.update(|cx| {
+                    let view = connection.views.borrow().get(&id).map(|projection| projection.view.clone());
+                    if let Some(view) = view
+                        && let Err(error) = view.update(cx, |thread, cx| update_workspace_notice(thread, workspace_error, cx))
+                    {
+                        log::debug!("workspace notice view detached: {error:#}");
+                    }
                     if let Some(control) = connection.config_controls.borrow().get(&id).and_then(std::rc::Weak::upgrade) {
                         let configuration = connection.configurations.borrow().get(&id).cloned().unwrap_or_default();
                         control.replace_options(runtime_model_options(&configuration, cx).unwrap_or_default());
@@ -760,11 +770,17 @@ impl AgentConnection for NativeRuntimeConnection {
             cx,
         );
         cx.spawn(async move |cx| {
-            let configuration = context.await?;
+            let (configuration, workspace_error) = context.await?;
             store
                 .create_root(id.clone(), serde_json::to_value(configuration)?)
                 .await?;
-            Ok(cx.update(|cx| self.projection(id, project, work_dirs, None, -1, cx)))
+            Ok(cx.update(|cx| {
+                let thread = self.projection(id, project, work_dirs, None, -1, cx);
+                thread.update(cx, |thread, cx| {
+                    update_workspace_notice(thread, workspace_error, cx)
+                });
+                thread
+            }))
         })
     }
 
@@ -788,16 +804,18 @@ impl AgentConnection for NativeRuntimeConnection {
             let snapshot = store.snapshot(id.clone()).await?;
             let configuration =
                 serde_json::from_value(store.metadata(snapshot.root_id.clone()).await?)?;
-            cx.update(|cx| {
-                self.register_project(snapshot.root_id, project.clone(), configuration, cx)
-            })
-            .await?;
+            let (_, workspace_error) = cx
+                .update(|cx| {
+                    self.register_project(snapshot.root_id, project.clone(), configuration, cx)
+                })
+                .await?;
             let page = store.transcript_page(id.clone(), None, PAGE_SIZE).await?;
             let position = page.entries.last().map_or(-1, |entry| entry.position);
             let thread =
                 cx.update(|cx| self.projection(id, project, work_dirs, title, position, cx));
             thread.update(cx, |thread, cx| {
-                project_history(thread, page.entries, true, cx)
+                project_history(thread, page.entries, true, cx);
+                update_workspace_notice(thread, workspace_error, cx);
             });
             Ok(thread)
         })
@@ -1473,6 +1491,28 @@ fn projection_notice(
     {
         thread.push_notice(
             acp_v2::Notice::new(acp_v2::NoticeSeverity::Warning, title).description(description),
+            cx,
+        );
+    }
+}
+
+fn update_workspace_notice(
+    thread: &mut AcpThread,
+    description: Option<String>,
+    cx: &mut gpui::Context<AcpThread>,
+) {
+    const TITLE: &str = "Editing workspace unavailable";
+    let previous = thread
+        .notices()
+        .iter()
+        .find(|(_, notice)| notice.title == TITLE)
+        .map(|(id, _)| *id);
+    if let Some(id) = previous {
+        thread.dismiss_notice(id, cx);
+    }
+    if let Some(description) = description {
+        thread.push_notice(
+            acp_v2::Notice::new(acp_v2::NoticeSeverity::Warning, TITLE).description(description),
             cx,
         );
     }

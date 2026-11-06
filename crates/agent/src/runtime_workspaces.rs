@@ -282,7 +282,7 @@ impl RuntimeWorkspaceProjects {
     }
 }
 
-fn requires_workspace(tool: &str) -> bool {
+pub(crate) fn requires_workspace(tool: &str) -> bool {
     matches!(
         tool,
         "edit_file"
